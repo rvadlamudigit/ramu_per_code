@@ -1,0 +1,70 @@
+# =============================================================================
+# Example YAML for the Oracle -> CSV -> S3 extract framework.
+# Copy this file, rename it for your job, and edit the values.
+# =============================================================================
+
+# -------------------------- Oracle source database ---------------------------
+oracle:
+  # auth_method: 'plain' or 'aws_secret'
+  #   plain      -> read user/password from this YAML
+  #   aws_secret -> fetch user/password from AWS Secrets Manager
+  auth_method: plain
+
+  # ------- when auth_method == plain -------
+  user: scott
+  password: tiger
+
+  # ------- when auth_method == aws_secret (uncomment and use these) -------
+  # auth_method: aws_secret
+  # secret_name: prod/oracle/etl_user
+  # aws_region:  us-east-1
+  # The secret value should be a JSON object with 'username' and 'password',
+  # e.g.  {"username": "etl_user", "password": "s3cret"}
+
+  # Required for both auth methods.
+  # Examples:
+  #   "host:1521/SERVICE_NAME"
+  #   "tcps://host:2484/SERVICE_NAME?wallet_location=/path/to/wallet"
+  dsn: oracle-host.example.com:1521/ORCL
+
+# ----------------------------------- SQL -------------------------------------
+sql: |
+  SELECT id, name, created_at, status
+  FROM big_table
+  WHERE updated_at >= SYSDATE - 1
+
+# ---------------------- Output (local CSV staging) ---------------------------
+output:
+  # Directory the CSV files are written to before S3 upload.
+  local_dir: /tmp/oracle_extracts
+
+  # Files are named: <base_filename>_1.csv, <base_filename>_2.csv, ...
+  base_filename: big_table_extract
+
+  # New file is started after this many rows. Set high for fewer/larger files.
+  records_per_file: 100000
+
+  csv:
+    delimiter: ","
+    include_header: true
+    quote_all: false
+
+# --------- Generator tuning: rows per Oracle round-trip (memory) -------------
+fetch:
+  array_size: 5000
+
+# ------------------------------- S3 destination ------------------------------
+s3:
+  bucket: my-data-bucket
+  # Optional key prefix. Final S3 key = "<prefix>/<base_filename>_<n>.csv"
+  prefix: extracts/big_table/2026/05/09/
+
+  # Optional. If set, files are uploaded with SSE-KMS using this key.
+  kms_key_id: arn:aws:kms:us-east-1:123456789012:key/abcd-1234-5678-9012-abcdef012345
+
+  # Optional. Otherwise boto3 uses the default credential/region chain.
+  aws_region: us-east-1
+
+# ---------------------------- After-upload behavior --------------------------
+# Local CSVs are deleted from local_dir after a successful S3 upload.
+cleanup_local: true
