@@ -1,13 +1,19 @@
 """
 runner.py -- CLI entry point for the Oracle -> S3 extract framework.
 
-This program owns BOTH:
-  1. The orchestration: it explicitly calls each step on the class in
-     the right order (connect -> execute_query -> write_csv_files ->
-     upload_to_s3 -> cleanup_local -> close).
-  2. The error presentation: a single main exception block maps each
-     framework exception type to a clear message and a distinct exit
-     code. The class itself never prints or sys.exits.
+This program drives the process. The class is a toolkit of independent
+functions; the runner explicitly calls each one in the right order:
+
+    Step 1  load_config         -- read YAML, return dict
+    Step 2  connect             -- open Oracle connection
+    Step 3  execute_query       -- generator over result batches
+    Step 4  write_csv_files     -- chunked CSV files on local disk
+    Step 5  upload_to_s3        -- upload (optionally KMS-encrypted)
+    Step 6  cleanup_local       -- delete local copies
+
+The runner also owns ALL error presentation: a single main exception
+block maps each framework exception to a clear message and a distinct
+exit code.
 
 Usage:
     python runner.py path/to/extract.yaml
@@ -83,39 +89,43 @@ def parse_args() -> argparse.Namespace:
 # ----------------------------------------------------------- orchestration --
 
 def run_extract(config_path: str) -> List[str]:
-    """Build the job and walk the pipeline step-by-step.
+    """Drive the extraction pipeline step-by-step.
 
-    Any framework exception raised by a step propagates out so the
-    caller's main exception block can present it.
+    The runner calls each function on the class explicitly. Any framework
+    exception raised by a step propagates out so the caller's main
+    exception block can present it.
     """
     log = logging.getLogger("runner")
-    log.info("Loading config: %s", config_path)
-
     job = OracleToS3Extract(config_path)
 
     try:
-        # Step 1: establish Oracle connection
-        log.info("Step 1/5: connecting to Oracle...")
+        # Step 1: load YAML config (returns dict, also stored on job.config)
+        log.info("Step 1/6: loading YAML config from %s ...", config_path)
+        config = job.load_config()
+        log.info("Loaded config sections: %s", sorted(config.keys()))
+
+        # Step 2: establish Oracle connection
+        log.info("Step 2/6: connecting to Oracle ...")
         job.connect()
 
-        # Step 2: execute SQL (returns a generator over batches)
-        log.info("Step 2/5: executing SQL...")
+        # Step 3: execute SQL (returns a generator over batches)
+        log.info("Step 3/6: executing SQL ...")
         batches = job.execute_query()
 
-        # Step 3: stream batches into chunked CSV files on local disk
-        log.info("Step 3/5: writing CSV files to local disk...")
+        # Step 4: stream batches into chunked CSV files on local disk
+        log.info("Step 4/6: writing CSV files to local disk ...")
         files = job.write_csv_files(batches)
 
         if not files:
             log.warning("No data extracted; nothing to upload.")
             return []
 
-        # Step 4: upload local files to S3 (with optional KMS)
-        log.info("Step 4/5: uploading %d file(s) to S3...", len(files))
+        # Step 5: upload local files to S3 (with optional KMS)
+        log.info("Step 5/6: uploading %d file(s) to S3 ...", len(files))
         uris = job.upload_to_s3(files)
 
-        # Step 5: delete local copies after successful upload
-        log.info("Step 5/5: cleaning up local files...")
+        # Step 6: delete local copies after successful upload
+        log.info("Step 6/6: cleaning up local files ...")
         job.cleanup_local(files)
 
         return uris

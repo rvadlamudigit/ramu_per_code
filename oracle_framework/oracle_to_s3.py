@@ -2,15 +2,12 @@
 oracle_to_s3.py
 Reusable Oracle -> CSV -> S3 extraction framework.
 
-Reads all metadata from a YAML config file. Streams Oracle query results
-through generators so very large tables don't blow memory, splits output
-into multiple CSV files at a configurable row count, and uploads the
-files to S3 with optional KMS encryption.
-
-The class only exposes building-block methods and RAISES exceptions on
-failure; it does not orchestrate, print, or sys.exit. The runner program
-is responsible for ordering the steps and catching exceptions in its
-main exception block.
+The class is a TOOLKIT of independent functions. The constructor only
+stores the config path; nothing is read or validated until the runner
+explicitly calls load_config(). Each public method does ONE thing and
+raises typed framework exceptions on failure -- it never prints or
+sys.exits. The runner program owns the orchestration order and the
+final exception handling.
 
 Exception hierarchy (all subclass OracleToS3ExtractError):
     OracleToS3ExtractError    -- base class for everything below
@@ -21,14 +18,15 @@ Exception hierarchy (all subclass OracleToS3ExtractError):
         CSVWriteError         -- failed to write a local CSV file
         S3UploadError         -- failed to upload to S3
 
-Typical usage (from a runner):
+Typical usage from a runner program:
     job = OracleToS3Extract("config/extract_example.yaml")
     try:
-        job.connect()
-        batches = job.execute_query()
-        files   = job.write_csv_files(batches)
-        uris    = job.upload_to_s3(files)
-        job.cleanup_local(files)
+        config  = job.load_config()             # Step 1
+        job.connect()                           # Step 2
+        batches = job.execute_query()           # Step 3 (generator)
+        files   = job.write_csv_files(batches)  # Step 4
+        uris    = job.upload_to_s3(files)       # Step 5
+        job.cleanup_local(files)                # Step 6
     finally:
         job.close()
 """
@@ -84,25 +82,43 @@ class S3UploadError(OracleToS3ExtractError):
 class OracleToS3Extract:
     """Reusable Oracle -> CSV -> S3 extraction toolkit driven by a YAML config.
 
-    All failure paths raise a subclass of OracleToS3ExtractError. No method
-    prints to stdout/stderr or calls sys.exit; that is the runner's job.
-    There is no end-to-end run() method on the class -- the runner program
-    composes the steps explicitly.
+    Each public method is independent. The runner is expected to call
+    load_config() first; subsequent methods rely on self.config being
+    populated and will raise ConfigError if it is not.
     """
 
     # ------------------------------------------------------------------ init
 
     def __init__(self, config_path: str):
+        """Light constructor: just stores the config path.
+
+        Nothing is read or validated until load_config() is called. This
+        keeps each piece of functionality independent and explicit.
+        """
         self.config_path = config_path
-        self.config = self._load_config(config_path)
-        self._validate_config(self.config)
+        self.config: Optional[dict] = None
         self.connection: Optional[oracledb.Connection] = None
         self.local_files: List[Path] = []
 
     # ---------------------------------------------------------------- config
 
-    @staticmethod
-    def _load_config(path: str) -> dict:
+    def load_config(self) -> dict:
+        """Step 1: read the YAML config file and return it as a dict.
+
+        Side effects:
+            - Stores the parsed dict on self.config so other methods can use it.
+            - Validates the schema; raises ConfigError on any problem.
+            - Logs an INFO message when reading is complete.
+
+        Returns:
+            The parsed YAML as a Python dict (also returned to the runner
+            so the runner can inspect / log keys if it wants).
+
+        Raises:
+            ConfigError on missing file, invalid YAML, non-mapping root,
+            or any schema violation.
+        """
+        path = self.config_path
         try:
             with open(path, "r") as fh:
                 cfg = yaml.safe_load(fh)
@@ -113,6 +129,10 @@ class OracleToS3Extract:
 
         if not isinstance(cfg, dict):
             raise ConfigError(f"Config at {path} did not parse to a mapping.")
+
+        self._validate_config(cfg)
+        self.config = cfg
+        logger.info("Config file read completed: %s", path)
         return cfg
 
     @staticmethod
@@ -151,6 +171,14 @@ class OracleToS3Extract:
 
         if "bucket" not in cfg["s3"]:
             raise ConfigError("s3.bucket is required")
+
+    def _require_config(self) -> dict:
+        """Internal guard: ensures load_config() was called before use."""
+        if self.config is None:
+            raise ConfigError(
+                "Config not loaded. Call load_config() before this method."
+            )
+        return self.config
 
     # --------------------------------------------------------------- secrets
 
@@ -193,7 +221,8 @@ class OracleToS3Extract:
 
         Raises ConfigError or SecretsManagerError on failure.
         """
-        oracle_cfg = self.config["oracle"]
+        cfg = self._require_config()
+        oracle_cfg = cfg["oracle"]
         method = str(oracle_cfg.get("auth_method", "plain")).lower()
 
         if method == "plain":
@@ -214,15 +243,15 @@ class OracleToS3Extract:
     # ------------------------------------------------------------ connection
 
     def connect(self) -> oracledb.Connection:
-        """Establish the Oracle connection.
+        """Step 2: establish the Oracle connection.
 
         Raises OracleConnectionError on driver/network failure.
-        Raises ConfigError or SecretsManagerError on credential resolution
-        failures (propagated from _resolve_credentials).
+        Raises ConfigError if load_config() was not called first.
+        Raises SecretsManagerError on credential fetch failure.
         """
-        # Resolve credentials first; let those errors propagate as-is.
+        cfg = self._require_config()
         user, password = self._resolve_credentials()
-        dsn = self.config["oracle"]["dsn"]
+        dsn = cfg["oracle"]["dsn"]
         logger.info("Connecting to Oracle dsn=%s as user=%s", dsn, user)
 
         try:
@@ -251,22 +280,24 @@ class OracleToS3Extract:
     # ---------------------------------------------------------------- query
 
     def execute_query(self) -> Iterator[Tuple[List[str], List[tuple]]]:
-        """Execute the configured SQL and yield (column_names, batch_rows).
+        """Step 3: execute the configured SQL and yield (column_names, batch_rows).
 
-        This is a generator so result sets larger than memory are streamed
-        in chunks of `fetch.array_size` rows. The writer consumes these
+        Generator-based: result sets larger than memory are streamed in
+        chunks of `fetch.array_size` rows. The writer consumes the
         batches lazily.
 
+        Raises ConfigError if load_config() was not called.
         Raises OracleConnectionError if connect() was not called.
-        Raises OracleQueryError if the cursor / fetch fails.
+        Raises OracleQueryError on cursor / fetch failures.
         """
+        cfg = self._require_config()
         if self.connection is None:
             raise OracleConnectionError(
                 "Call connect() before execute_query()."
             )
 
-        sql = self.config["sql"]
-        array_size = int(self.config.get("fetch", {}).get("array_size", 5000))
+        sql = cfg["sql"]
+        array_size = int(cfg.get("fetch", {}).get("array_size", 5000))
 
         try:
             cursor = self.connection.cursor()
@@ -304,15 +335,17 @@ class OracleToS3Extract:
     def write_csv_files(
         self, batches: Iterable[Tuple[List[str], List[tuple]]]
     ) -> List[Path]:
-        """Write a stream of batches to one or more local CSV files.
+        """Step 4: write a stream of batches to one or more local CSV files.
 
         Splits when the row count for the current file reaches
         records_per_file. File names follow <base>_<n>.csv (1-indexed).
         Returns the list of file paths written.
 
+        Raises ConfigError if load_config() was not called.
         Raises CSVWriteError on filesystem errors.
         """
-        out_cfg = self.config["output"]
+        cfg = self._require_config()
+        out_cfg = cfg["output"]
         local_dir = Path(out_cfg["local_dir"])
         base = out_cfg["base_filename"]
         records_per_file = int(out_cfg["records_per_file"])
@@ -386,12 +419,14 @@ class OracleToS3Extract:
     # -------------------------------------------------------------------- s3
 
     def upload_to_s3(self, files: Iterable[Path]) -> List[str]:
-        """Upload local CSV files to S3 with optional SSE-KMS encryption.
+        """Step 5: upload local CSV files to S3 with optional SSE-KMS encryption.
 
         Returns the list of s3:// URIs uploaded.
+        Raises ConfigError if load_config() was not called.
         Raises S3UploadError on the first failed upload.
         """
-        s3_cfg = self.config["s3"]
+        cfg = self._require_config()
+        s3_cfg = cfg["s3"]
         bucket = s3_cfg["bucket"]
         prefix = str(s3_cfg.get("prefix", "")).lstrip("/")
         kms_key_id = s3_cfg.get("kms_key_id")
@@ -422,12 +457,13 @@ class OracleToS3Extract:
         return uris
 
     def cleanup_local(self, files: Iterable[Path]) -> None:
-        """Delete local CSV files after a successful S3 upload.
+        """Step 6: delete local CSV files after a successful S3 upload.
 
         Honors the optional `cleanup_local` flag in the YAML (default true).
         Best-effort: logs a warning on per-file failure, does not raise.
         """
-        if not bool(self.config.get("cleanup_local", True)):
+        cfg = self._require_config()
+        if not bool(cfg.get("cleanup_local", True)):
             logger.info("cleanup_local=false; keeping local files.")
             return
         for path in files:
