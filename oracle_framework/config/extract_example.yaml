@@ -68,3 +68,55 @@ s3:
 # ---------------------------- After-upload behavior --------------------------
 # Local CSVs are deleted from local_dir after a successful S3 upload.
 cleanup_local: true
+
+# ===================== Optional: logging via LoggerClient ====================
+# When this section is present, the runner switches the root logger over
+# to LoggerClient (logger.py). Output options:
+#   STDOUT   -- stream only
+#   LOGFILE  -- .log/.error/.critical files only
+#   BOTH     -- stream + files (default)
+#
+# Files are written to:
+#   <root_directory>/<project_name>/logfiles/<process_name>/
+#       <process_name>_<timestamp>.log
+#       <process_name>_<timestamp>.error
+#       <process_name>_<timestamp>.critical
+#
+# Comment out the whole section to fall back to stdlib basic logging.
+logging:
+  project_name:    oracle_framework
+  process_name:    big_table_extract
+  root_directory:  /var/log/oracle_framework
+  output:          BOTH
+
+# ================== Optional: email notifications via sdc_email ==============
+# When a section here has `enabled: true`, the runner sends an SMTP
+# notification at that lifecycle event. Notifications are best-effort:
+# a notification failure is logged but does not change the program's
+# exit code.
+#
+# The `.log` file produced by LoggerClient (if configured above) is
+# attached automatically when present.
+notifications:
+  on_failure:
+    enabled:        false
+    smtp_server:    smtp.example.com
+    from_addr:      noreply@example.com
+    to_addr:        ops@example.com,backup@example.com
+    subject_prefix: "[oracle_framework]"
+    port:           25
+    use_tls:        false
+    # Optional auth (only if your relay requires it):
+    username:       null
+    password:       null
+
+  on_success:
+    enabled:        false
+    smtp_server:    smtp.example.com
+    from_addr:      noreply@example.com
+    to_addr:        ops@example.com
+    subject_prefix: "[oracle_framework]"
+    port:           25
+    use_tls:        false
+    username:       null
+    password:       null
