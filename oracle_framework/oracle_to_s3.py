@@ -8,6 +8,19 @@ into multiple CSV files at a configurable row count, and uploads the
 files to S3 with optional KMS encryption. Local files are removed after
 a successful upload.
 
+The class only RAISES exceptions; it does not print or sys.exit.
+The runner program is responsible for catching them in its main
+exception block and presenting them to the user.
+
+Exception hierarchy (all subclass OracleToS3ExtractError):
+    OracleToS3ExtractError    -- base class for everything below
+        ConfigError           -- bad / missing YAML configuration
+        SecretsManagerError   -- failed to fetch secret from AWS
+        OracleConnectionError -- could not connect to Oracle
+        OracleQueryError      -- query execution failed
+        CSVWriteError         -- failed to write a local CSV file
+        S3UploadError         -- failed to upload to S3
+
 Usage:
     from oracle_to_s3 import OracleToS3Extract
     job = OracleToS3Extract("config/extract_example.yaml")
@@ -19,7 +32,6 @@ from __future__ import annotations
 import csv
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Tuple
 
@@ -31,22 +43,43 @@ from botocore.exceptions import BotoCoreError, ClientError
 logger = logging.getLogger(__name__)
 
 
-class OracleToS3ExtractError(Exception):
-    """Raised for any framework-level extraction failure."""
+# --------------------------------------------------------------- exceptions
 
+class OracleToS3ExtractError(Exception):
+    """Base exception for the framework. All framework errors subclass this."""
+
+
+class ConfigError(OracleToS3ExtractError):
+    """Invalid or missing YAML configuration."""
+
+
+class SecretsManagerError(OracleToS3ExtractError):
+    """Failed to fetch credentials from AWS Secrets Manager."""
+
+
+class OracleConnectionError(OracleToS3ExtractError):
+    """Failed to establish Oracle database connection."""
+
+
+class OracleQueryError(OracleToS3ExtractError):
+    """Failed to execute the configured Oracle query."""
+
+
+class CSVWriteError(OracleToS3ExtractError):
+    """Failed to write a CSV file to local disk."""
+
+
+class S3UploadError(OracleToS3ExtractError):
+    """Failed to upload one or more files to S3."""
+
+
+# ----------------------------------------------------------------- main class
 
 class OracleToS3Extract:
     """Reusable Oracle -> CSV -> S3 extraction job driven by a YAML config.
 
-    Public methods:
-        get_secret_from_aws  -- fetch credentials from AWS Secrets Manager
-        connect              -- establish Oracle connection
-        execute_query        -- run SQL and yield rows in batches (generator)
-        write_csv_files      -- write a stream of batches to chunked CSV files
-        upload_to_s3         -- upload local files to S3 with optional KMS
-        cleanup_local        -- delete local files after successful upload
-        run                  -- end-to-end orchestration
-        close                -- close the Oracle connection
+    All failure paths raise a subclass of OracleToS3ExtractError. No method
+    prints to stdout/stderr or calls sys.exit; that is the runner's job.
     """
 
     # ------------------------------------------------------------------ init
@@ -62,37 +95,41 @@ class OracleToS3Extract:
 
     @staticmethod
     def _load_config(path: str) -> dict:
-        with open(path, "r") as fh:
-            cfg = yaml.safe_load(fh)
+        try:
+            with open(path, "r") as fh:
+                cfg = yaml.safe_load(fh)
+        except FileNotFoundError as e:
+            raise ConfigError(f"Config file not found: {path}") from e
+        except yaml.YAMLError as e:
+            raise ConfigError(f"Invalid YAML in {path}: {e}") from e
+
         if not isinstance(cfg, dict):
-            raise OracleToS3ExtractError(
-                f"Config at {path} did not parse to a mapping."
-            )
+            raise ConfigError(f"Config at {path} did not parse to a mapping.")
         return cfg
 
     @staticmethod
     def _validate_config(cfg: dict) -> None:
         for key in ("oracle", "sql", "output", "s3"):
             if key not in cfg:
-                raise OracleToS3ExtractError(f"Missing required config key: {key}")
+                raise ConfigError(f"Missing required config key: {key}")
 
         oracle_cfg = cfg["oracle"]
         if "dsn" not in oracle_cfg:
-            raise OracleToS3ExtractError("oracle.dsn is required")
+            raise ConfigError("oracle.dsn is required")
 
         method = str(oracle_cfg.get("auth_method", "plain")).lower()
         if method == "plain":
             if not oracle_cfg.get("user") or not oracle_cfg.get("password"):
-                raise OracleToS3ExtractError(
+                raise ConfigError(
                     "auth_method 'plain' requires oracle.user and oracle.password"
                 )
         elif method == "aws_secret":
             if not oracle_cfg.get("secret_name"):
-                raise OracleToS3ExtractError(
+                raise ConfigError(
                     "auth_method 'aws_secret' requires oracle.secret_name"
                 )
         else:
-            raise OracleToS3ExtractError(
+            raise ConfigError(
                 f"Unknown oracle.auth_method '{method}'; "
                 "expected 'plain' or 'aws_secret'"
             )
@@ -100,12 +137,12 @@ class OracleToS3Extract:
         out = cfg["output"]
         for k in ("local_dir", "base_filename", "records_per_file"):
             if k not in out:
-                raise OracleToS3ExtractError(f"output.{k} is required")
+                raise ConfigError(f"output.{k} is required")
         if int(out["records_per_file"]) <= 0:
-            raise OracleToS3ExtractError("output.records_per_file must be > 0")
+            raise ConfigError("output.records_per_file must be > 0")
 
         if "bucket" not in cfg["s3"]:
-            raise OracleToS3ExtractError("s3.bucket is required")
+            raise ConfigError("s3.bucket is required")
 
     # --------------------------------------------------------------- secrets
 
@@ -117,32 +154,37 @@ class OracleToS3Extract:
 
         The secret is expected to be a JSON object containing at minimum
         'username' (or 'user') and 'password' fields.
+
+        Raises SecretsManagerError on any failure.
         """
         try:
             session = boto3.session.Session(region_name=region)
             client = session.client("secretsmanager")
             response = client.get_secret_value(SecretId=secret_name)
         except (BotoCoreError, ClientError) as e:
-            raise OracleToS3ExtractError(
+            raise SecretsManagerError(
                 f"Failed to fetch secret '{secret_name}' from "
                 f"Secrets Manager: {e}"
             ) from e
 
         secret_string = response.get("SecretString")
         if not secret_string:
-            raise OracleToS3ExtractError(
+            raise SecretsManagerError(
                 f"Secret '{secret_name}' is empty or binary; "
                 "expected a JSON string."
             )
         try:
             return json.loads(secret_string)
         except json.JSONDecodeError as e:
-            raise OracleToS3ExtractError(
+            raise SecretsManagerError(
                 f"Secret '{secret_name}' is not valid JSON: {e}"
             ) from e
 
     def _resolve_credentials(self) -> Tuple[str, str]:
-        """Return (user, password) based on configured auth_method."""
+        """Return (user, password) based on the configured auth_method.
+
+        Raises ConfigError or SecretsManagerError on failure.
+        """
         oracle_cfg = self.config["oracle"]
         method = str(oracle_cfg.get("auth_method", "plain")).lower()
 
@@ -156,7 +198,7 @@ class OracleToS3Extract:
         user = secret.get("username") or secret.get("user")
         password = secret.get("password")
         if not user or not password:
-            raise OracleToS3ExtractError(
+            raise SecretsManagerError(
                 f"Secret '{secret_name}' missing 'username'/'password' fields"
             )
         return user, password
@@ -164,24 +206,29 @@ class OracleToS3Extract:
     # ------------------------------------------------------------ connection
 
     def connect(self) -> oracledb.Connection:
-        """Establish the Oracle connection. Print the error and re-raise on failure."""
+        """Establish the Oracle connection.
+
+        Raises OracleConnectionError on driver/network failure.
+        Raises ConfigError or SecretsManagerError on credential resolution
+        failures (propagated from _resolve_credentials).
+        """
+        # Resolve credentials first; let those errors propagate as-is.
+        user, password = self._resolve_credentials()
+        dsn = self.config["oracle"]["dsn"]
+        logger.info("Connecting to Oracle dsn=%s as user=%s", dsn, user)
+
         try:
-            user, password = self._resolve_credentials()
-            dsn = self.config["oracle"]["dsn"]
-            logger.info("Connecting to Oracle dsn=%s as user=%s", dsn, user)
             self.connection = oracledb.connect(
                 user=user, password=password, dsn=dsn
             )
             logger.info("Oracle connection established.")
             return self.connection
         except oracledb.Error as e:
-            print(f"[ERROR] Failed to connect to Oracle: {e}")
-            raise OracleToS3ExtractError(f"Oracle connection failed: {e}") from e
-        except OracleToS3ExtractError:
-            raise
+            raise OracleConnectionError(f"Oracle connection failed: {e}") from e
         except Exception as e:
-            print(f"[ERROR] Unexpected error establishing Oracle connection: {e}")
-            raise OracleToS3ExtractError(str(e)) from e
+            raise OracleConnectionError(
+                f"Unexpected error establishing Oracle connection: {e}"
+            ) from e
 
     def close(self) -> None:
         """Close the Oracle connection if it is open."""
@@ -201,33 +248,47 @@ class OracleToS3Extract:
         This is a generator so result sets larger than memory are streamed
         in chunks of `fetch.array_size` rows. The writer consumes these
         batches lazily.
+
+        Raises OracleQueryError if the cursor / fetch fails.
         """
         if self.connection is None:
-            raise OracleToS3ExtractError("Call connect() before execute_query().")
+            raise OracleConnectionError(
+                "Call connect() before execute_query()."
+            )
 
         sql = self.config["sql"]
         array_size = int(self.config.get("fetch", {}).get("array_size", 5000))
 
-        cursor = self.connection.cursor()
-        cursor.arraysize = array_size
-        # Recommended: prefetchrows == arraysize + 1 in oracledb
         try:
-            cursor.prefetchrows = array_size + 1
-        except AttributeError:
-            pass
+            cursor = self.connection.cursor()
+            cursor.arraysize = array_size
+            try:
+                cursor.prefetchrows = array_size + 1
+            except AttributeError:
+                pass
 
-        logger.info("Executing query (arraysize=%s):\n%s", array_size, sql)
-        cursor.execute(sql)
-        column_names = [d[0] for d in cursor.description]
+            logger.info("Executing query (arraysize=%s):\n%s", array_size, sql)
+            cursor.execute(sql)
+            column_names = [d[0] for d in cursor.description]
+        except oracledb.Error as e:
+            raise OracleQueryError(f"Failed to execute query: {e}") from e
 
         try:
             while True:
-                batch = cursor.fetchmany(array_size)
+                try:
+                    batch = cursor.fetchmany(array_size)
+                except oracledb.Error as e:
+                    raise OracleQueryError(
+                        f"Failed while fetching rows: {e}"
+                    ) from e
                 if not batch:
                     break
                 yield column_names, batch
         finally:
-            cursor.close()
+            try:
+                cursor.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     # --------------------------------------------------------------- writing
 
@@ -239,6 +300,8 @@ class OracleToS3Extract:
         Splits when the row count for the current file reaches
         records_per_file. File names follow <base>_<n>.csv (1-indexed).
         Returns the list of file paths written.
+
+        Raises CSVWriteError on filesystem errors.
         """
         out_cfg = self.config["output"]
         local_dir = Path(out_cfg["local_dir"])
@@ -249,7 +312,12 @@ class OracleToS3Extract:
         include_header = csv_cfg.get("include_header", True)
         quote_all = csv_cfg.get("quote_all", False)
 
-        local_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            local_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise CSVWriteError(
+                f"Could not create local_dir {local_dir}: {e}"
+            ) from e
 
         file_index = 0
         rows_in_current = 0
@@ -262,7 +330,10 @@ class OracleToS3Extract:
             nonlocal file_handle, writer, file_index, rows_in_current
             file_index += 1
             path = local_dir / f"{base}_{file_index}.csv"
-            file_handle = open(path, "w", newline="", encoding="utf-8")
+            try:
+                file_handle = open(path, "w", newline="", encoding="utf-8")
+            except OSError as e:
+                raise CSVWriteError(f"Could not open {path}: {e}") from e
             writer = csv.writer(
                 file_handle,
                 delimiter=delimiter,
@@ -284,11 +355,20 @@ class OracleToS3Extract:
                     if rows_in_current >= records_per_file:
                         file_handle.close()
                         open_new_file()
-                    writer.writerow(row)
+                    try:
+                        writer.writerow(row)
+                    except (OSError, csv.Error) as e:
+                        raise CSVWriteError(
+                            f"Failed writing row to "
+                            f"{files[-1] if files else '<unknown>'}: {e}"
+                        ) from e
                     rows_in_current += 1
         finally:
             if file_handle and not file_handle.closed:
-                file_handle.close()
+                try:
+                    file_handle.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
         self.local_files = files
         logger.info("Wrote %d file(s).", len(files))
@@ -299,7 +379,8 @@ class OracleToS3Extract:
     def upload_to_s3(self, files: Iterable[Path]) -> List[str]:
         """Upload local CSV files to S3 with optional SSE-KMS encryption.
 
-        Returns the list of s3:// URIs uploaded. Raises on any failure.
+        Returns the list of s3:// URIs uploaded.
+        Raises S3UploadError on the first failed upload.
         """
         s3_cfg = self.config["s3"]
         bucket = s3_cfg["bucket"]
@@ -307,10 +388,13 @@ class OracleToS3Extract:
         kms_key_id = s3_cfg.get("kms_key_id")
         region = s3_cfg.get("aws_region")
 
-        session = boto3.session.Session(region_name=region)
-        s3 = session.client("s3")
-        uris: List[str] = []
+        try:
+            session = boto3.session.Session(region_name=region)
+            s3 = session.client("s3")
+        except (BotoCoreError, ClientError) as e:
+            raise S3UploadError(f"Failed to create S3 client: {e}") from e
 
+        uris: List[str] = []
         for path in files:
             key = f"{prefix.rstrip('/')}/{path.name}" if prefix else path.name
             extra: dict = {}
@@ -322,14 +406,17 @@ class OracleToS3Extract:
                 uri = f"s3://{bucket}/{key}"
                 uris.append(uri)
                 logger.info("Uploaded %s -> %s", path, uri)
-            except (BotoCoreError, ClientError) as e:
-                raise OracleToS3ExtractError(
+            except (BotoCoreError, ClientError, OSError) as e:
+                raise S3UploadError(
                     f"Failed to upload {path} to s3://{bucket}/{key}: {e}"
                 ) from e
         return uris
 
     def cleanup_local(self, files: Iterable[Path]) -> None:
-        """Delete local CSV files after a successful S3 upload."""
+        """Delete local CSV files after a successful S3 upload.
+
+        Best-effort: logs a warning on per-file failure, does not raise.
+        """
         if not bool(self.config.get("cleanup_local", True)):
             logger.info("cleanup_local=false; keeping local files.")
             return
@@ -346,6 +433,7 @@ class OracleToS3Extract:
         """End-to-end pipeline: connect -> query -> CSV -> S3 -> cleanup.
 
         Returns the list of s3:// URIs uploaded.
+        Any framework exception is re-raised for the runner to handle.
         """
         try:
             self.connect()
