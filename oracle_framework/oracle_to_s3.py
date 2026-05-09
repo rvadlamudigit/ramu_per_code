@@ -5,12 +5,12 @@ Reusable Oracle -> CSV -> S3 extraction framework.
 Reads all metadata from a YAML config file. Streams Oracle query results
 through generators so very large tables don't blow memory, splits output
 into multiple CSV files at a configurable row count, and uploads the
-files to S3 with optional KMS encryption. Local files are removed after
-a successful upload.
+files to S3 with optional KMS encryption.
 
-The class only RAISES exceptions; it does not print or sys.exit.
-The runner program is responsible for catching them in its main
-exception block and presenting them to the user.
+The class only exposes building-block methods and RAISES exceptions on
+failure; it does not orchestrate, print, or sys.exit. The runner program
+is responsible for ordering the steps and catching exceptions in its
+main exception block.
 
 Exception hierarchy (all subclass OracleToS3ExtractError):
     OracleToS3ExtractError    -- base class for everything below
@@ -21,10 +21,16 @@ Exception hierarchy (all subclass OracleToS3ExtractError):
         CSVWriteError         -- failed to write a local CSV file
         S3UploadError         -- failed to upload to S3
 
-Usage:
-    from oracle_to_s3 import OracleToS3Extract
+Typical usage (from a runner):
     job = OracleToS3Extract("config/extract_example.yaml")
-    job.run()
+    try:
+        job.connect()
+        batches = job.execute_query()
+        files   = job.write_csv_files(batches)
+        uris    = job.upload_to_s3(files)
+        job.cleanup_local(files)
+    finally:
+        job.close()
 """
 
 from __future__ import annotations
@@ -76,10 +82,12 @@ class S3UploadError(OracleToS3ExtractError):
 # ----------------------------------------------------------------- main class
 
 class OracleToS3Extract:
-    """Reusable Oracle -> CSV -> S3 extraction job driven by a YAML config.
+    """Reusable Oracle -> CSV -> S3 extraction toolkit driven by a YAML config.
 
     All failure paths raise a subclass of OracleToS3ExtractError. No method
     prints to stdout/stderr or calls sys.exit; that is the runner's job.
+    There is no end-to-end run() method on the class -- the runner program
+    composes the steps explicitly.
     """
 
     # ------------------------------------------------------------------ init
@@ -231,7 +239,7 @@ class OracleToS3Extract:
             ) from e
 
     def close(self) -> None:
-        """Close the Oracle connection if it is open."""
+        """Close the Oracle connection if it is open. Safe to call multiple times."""
         if self.connection is not None:
             try:
                 self.connection.close()
@@ -249,6 +257,7 @@ class OracleToS3Extract:
         in chunks of `fetch.array_size` rows. The writer consumes these
         batches lazily.
 
+        Raises OracleConnectionError if connect() was not called.
         Raises OracleQueryError if the cursor / fetch fails.
         """
         if self.connection is None:
@@ -415,6 +424,7 @@ class OracleToS3Extract:
     def cleanup_local(self, files: Iterable[Path]) -> None:
         """Delete local CSV files after a successful S3 upload.
 
+        Honors the optional `cleanup_local` flag in the YAML (default true).
         Best-effort: logs a warning on per-file failure, does not raise.
         """
         if not bool(self.config.get("cleanup_local", True)):
@@ -426,24 +436,3 @@ class OracleToS3Extract:
                 logger.info("Deleted local file %s", path)
             except OSError as e:
                 logger.warning("Could not delete %s: %s", path, e)
-
-    # ------------------------------------------------------------ orchestrate
-
-    def run(self) -> List[str]:
-        """End-to-end pipeline: connect -> query -> CSV -> S3 -> cleanup.
-
-        Returns the list of s3:// URIs uploaded.
-        Any framework exception is re-raised for the runner to handle.
-        """
-        try:
-            self.connect()
-            batches = self.execute_query()
-            files = self.write_csv_files(batches)
-            if not files:
-                logger.warning("No data extracted; nothing to upload.")
-                return []
-            uris = self.upload_to_s3(files)
-            self.cleanup_local(files)
-            return uris
-        finally:
-            self.close()

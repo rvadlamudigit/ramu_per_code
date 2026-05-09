@@ -1,18 +1,13 @@
 """
 runner.py -- CLI entry point for the Oracle -> S3 extract framework.
 
-This program owns ALL error presentation. The framework class only
-raises exceptions; this runner has a single main exception block that
-maps each exception type to a clear message and an appropriate exit
-code.
-
-Pipeline:
-    1. Load YAML config (constructor of OracleToS3Extract)
-    2. Establish Oracle connection
-    3. Execute SQL (streamed via generator)
-    4. Write results to chunked CSV files on local disk
-    5. Upload files to S3 (with optional KMS)
-    6. Delete local files after successful upload
+This program owns BOTH:
+  1. The orchestration: it explicitly calls each step on the class in
+     the right order (connect -> execute_query -> write_csv_files ->
+     upload_to_s3 -> cleanup_local -> close).
+  2. The error presentation: a single main exception block maps each
+     framework exception type to a clear message and a distinct exit
+     code. The class itself never prints or sys.exits.
 
 Usage:
     python runner.py path/to/extract.yaml
@@ -25,6 +20,7 @@ import argparse
 import logging
 import sys
 import traceback
+from typing import List
 
 from oracle_to_s3 import (
     OracleToS3Extract,
@@ -84,13 +80,51 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_extract(config_path: str) -> list:
-    """Build the job and run the full pipeline. Errors propagate."""
+# ----------------------------------------------------------- orchestration --
+
+def run_extract(config_path: str) -> List[str]:
+    """Build the job and walk the pipeline step-by-step.
+
+    Any framework exception raised by a step propagates out so the
+    caller's main exception block can present it.
+    """
     log = logging.getLogger("runner")
     log.info("Loading config: %s", config_path)
-    job = OracleToS3Extract(config_path)
-    return job.run()
 
+    job = OracleToS3Extract(config_path)
+
+    try:
+        # Step 1: establish Oracle connection
+        log.info("Step 1/5: connecting to Oracle...")
+        job.connect()
+
+        # Step 2: execute SQL (returns a generator over batches)
+        log.info("Step 2/5: executing SQL...")
+        batches = job.execute_query()
+
+        # Step 3: stream batches into chunked CSV files on local disk
+        log.info("Step 3/5: writing CSV files to local disk...")
+        files = job.write_csv_files(batches)
+
+        if not files:
+            log.warning("No data extracted; nothing to upload.")
+            return []
+
+        # Step 4: upload local files to S3 (with optional KMS)
+        log.info("Step 4/5: uploading %d file(s) to S3...", len(files))
+        uris = job.upload_to_s3(files)
+
+        # Step 5: delete local copies after successful upload
+        log.info("Step 5/5: cleaning up local files...")
+        job.cleanup_local(files)
+
+        return uris
+    finally:
+        # Always close the Oracle connection, even on error.
+        job.close()
+
+
+# --------------------------------------------------------------------- main --
 
 def main() -> int:
     args = parse_args()
@@ -135,7 +169,8 @@ def main() -> int:
         return EXIT_S3
 
     except OracleToS3ExtractError as e:
-        # Catches any framework error not covered by the specific cases above.
+        # Fallback for any new framework exception subclass we haven't
+        # added a specific handler for above.
         print(f"[ERROR] Extract failed: {e}", file=sys.stderr)
         return EXIT_GENERIC
 
@@ -144,8 +179,7 @@ def main() -> int:
         return EXIT_INTERRUPT
 
     except Exception as e:  # noqa: BLE001
-        # Catch-all for anything not raised by the framework. We print the
-        # traceback so unexpected bugs are visible during development.
+        # Final safety net: anything not raised by the framework.
         print(
             f"[ERROR] Unexpected error: {type(e).__name__}: {e}",
             file=sys.stderr,
