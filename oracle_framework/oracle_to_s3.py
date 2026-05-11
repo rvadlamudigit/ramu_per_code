@@ -2,18 +2,18 @@
 oracle_to_s3.py
 Reusable Oracle -> CSV -> S3 extraction framework.
 
-The class is a TOOLKIT of independent functions. The constructor only
-stores the config path; nothing is read until the runner explicitly
-calls load_config(). Each public method does ONE thing and raises typed
-framework exceptions on failure -- it never prints or sys.exits. The
-runner program owns the orchestration order, schema VALIDATION
-(see runner.validate_config), and the final exception handling.
+The class is a TOOLKIT of independent functions. The runner is the
+orchestrator: it reads the YAML, validates the schema, builds the
+LoggerClient, and then constructs the framework class with both the
+logger and the already-parsed config dict. The class itself never
+opens files, never validates, never prints, and never sys.exits --
+it just runs the steps you call on it and raises typed framework
+exceptions on failure.
 
 Exception hierarchy (all subclass OracleToS3ExtractError):
     OracleToS3ExtractError    -- base class for everything below
-        ConfigError           -- missing / unreadable / unparseable YAML
-                                 (also raised by runner.validate_config
-                                 for schema problems)
+        ConfigError           -- raised by runner.validate_config or by
+                                 runtime guard rails inside the class
         SecretsManagerError   -- failed to fetch secret from AWS
         OracleConnectionError -- could not connect to Oracle
         OracleQueryError      -- query execution failed
@@ -21,16 +21,23 @@ Exception hierarchy (all subclass OracleToS3ExtractError):
         S3UploadError         -- failed to upload to S3
 
 Typical usage from a runner program:
-    from runner import validate_config
-    job = OracleToS3Extract("config/extract_example.yaml")
+    from logger import LoggerClient
+    from oracle_to_s3 import OracleToS3Extract
+    from runner import read_yaml, validate_config
+
+    cfg = read_yaml("config/extract_example.yaml")
+    validate_config(cfg)
+    lc  = LoggerClient(project_name="oracle_framework",
+                       process_name="big_table_extract",
+                       root_directory="/var/log/oracle_framework",
+                       logoutput="BOTH")
+    job = OracleToS3Extract(lc, cfg)
     try:
-        cfg     = job.load_config()             # Step 1a: read YAML
-        validate_config(cfg)                    # Step 1b: schema check
-        job.connect()                           # Step 2
-        batches = job.execute_query()           # Step 3 (generator)
-        files   = job.write_csv_files(batches)  # Step 4
-        uris    = job.upload_to_s3(files)       # Step 5
-        job.cleanup_local(files)                # Step 6
+        job.connect()
+        batches = job.execute_query()
+        files   = job.write_csv_files(batches)
+        uris    = job.upload_to_s3(files)
+        job.cleanup_local(files)
     finally:
         job.close()
 """
@@ -39,8 +46,6 @@ from __future__ import annotations
 
 import csv
 import json
-import logging
-import os
 import platform
 import sys
 import time
@@ -49,10 +54,9 @@ from typing import Any, Iterable, Iterator, List, Optional, Tuple
 
 import boto3
 import oracledb
-import yaml
 from botocore.exceptions import BotoCoreError, ClientError
 
-logger = logging.getLogger(__name__)
+from logger import LoggerClient
 
 
 # ---------------------------------------------------------- helpers / utilities
@@ -147,36 +151,67 @@ class S3UploadError(OracleToS3ExtractError):
 # ----------------------------------------------------------------- main class
 
 class OracleToS3Extract:
-    """Reusable Oracle -> CSV -> S3 extraction toolkit driven by a YAML config.
+    """Reusable Oracle -> CSV -> S3 extraction toolkit.
 
-    Each public method is independent. The runner is expected to call
-    load_config() first; subsequent methods rely on self.config being
-    populated and will raise ConfigError if it is not.
+    Construction takes the LoggerClient and the already-parsed,
+    already-validated config dict. After construction the class is
+    self-contained: every method uses the same `lc.logfile` logger
+    and the same `self.config` dict.
     """
 
     # ------------------------------------------------------------------ init
 
-    def __init__(self, config_path: str, *, debug: bool = False):
-        """Light constructor: just stores the config path and the debug flag.
-
-        Nothing is read or validated until load_config() is called. This
-        keeps each piece of functionality independent and explicit.
+    def __init__(
+        self,
+        lc: LoggerClient,
+        config: dict,
+        *,
+        debug: bool = False,
+    ):
+        """Build a job from a LoggerClient and a parsed/validated config.
 
         Parameters
         ----------
-        config_path : str
-            Path to the YAML configuration file.
+        lc : LoggerClient
+            Already-constructed logger. The class uses ``lc.logfile`` --
+            a real ``logging.Logger`` -- for every log call. This
+            replaces the old module-level ``logging.getLogger(__name__)``
+            and guarantees that every framework log line flows through
+            the same handlers (stdout, .log, .error, .critical, .debug)
+            that the runner configured.
+        config : dict
+            The fully-parsed YAML config. The runner is responsible for
+            reading the file (``runner.read_yaml``) and validating the
+            schema (``runner.validate_config``) before constructing the
+            class. The class trusts the dict and never re-validates it.
         debug : bool, default False
-            When True, every step emits substantially more verbose logs
-            (per-batch row counts, per-file sizes, timings, redacted
-            config dumps, Oracle/boto3 versions, environment metadata).
-            The runner can turn this on via --debug.
+            Mirrors the runner's --debug flag. When True, every step
+            emits substantially more verbose logs (per-batch row counts,
+            per-file sizes, timings, redacted config dumps, Oracle/boto3
+            versions, environment metadata).
         """
-        self.config_path = config_path
-        self.debug = bool(debug)
-        self.config: Optional[dict] = None
+        if lc is None:
+            raise ConfigError("OracleToS3Extract requires a LoggerClient")
+        if not isinstance(config, dict):
+            raise ConfigError(
+                "OracleToS3Extract requires a dict config "
+                "(use runner.read_yaml + runner.validate_config first)"
+            )
+
+        self.lc = lc
+        # Convenience handle: the actual stdlib Logger inside the
+        # LoggerClient. All log calls in this file go through it.
+        self.log = lc.logfile
+
+        # In-YAML `debug: true` is honoured the same way it was in the
+        # old load_config(). The runner's --debug always wins because
+        # it is OR'd in at construction time.
+        self.debug = bool(debug) or bool(config.get("debug", False))
+
+        self.config: dict = config
         self.connection: Optional[oracledb.Connection] = None
         self.local_files: List[Path] = []
+
         # Cumulative metrics; populated as the pipeline runs.
         self.metrics: dict = {
             "rows_total": 0,
@@ -189,99 +224,30 @@ class OracleToS3Extract:
             "elapsed_write_s": 0.0,
             "elapsed_upload_s": 0.0,
         }
-        logger.debug(
-            "OracleToS3Extract instantiated (config_path=%s, debug=%s, "
-            "python=%s, oracledb=%s, boto3=%s, platform=%s)",
-            config_path, self.debug, sys.version.split()[0],
+
+        self.log.debug(
+            "OracleToS3Extract instantiated (debug=%s, python=%s, "
+            "oracledb=%s, boto3=%s, platform=%s)",
+            self.debug, sys.version.split()[0],
             getattr(oracledb, "__version__", "?"),
             getattr(boto3, "__version__", "?"),
             platform.platform(),
         )
-
-    # ---------------------------------------------------------------- config
-
-    def load_config(self) -> dict:
-        """Step 1: read the YAML config file and return it as a dict.
-
-        This method only reads, parses, and stores the YAML. **Schema
-        validation lives in the runner** (`runner.validate_config`) so
-        that orchestration concerns stay in the runner and the framework
-        class stays a pure toolkit. Library callers that bypass the
-        runner are expected to either call `runner.validate_config(cfg)`
-        themselves or accept that a malformed config will surface as a
-        KeyError / TypeError later in the pipeline.
-
-        Side effects:
-            - Stores the parsed dict on self.config so other methods can use it.
-            - Logs an INFO message when reading is complete.
-
-        Returns:
-            The parsed YAML as a Python dict (also returned to the runner
-            so the runner can inspect / log / validate it).
-
-        Raises:
-            ConfigError on missing file, invalid YAML, or a non-mapping root.
-        """
-        path = self.config_path
-        logger.debug("load_config: opening %s", path)
-        try:
-            file_size = os.path.getsize(path)
-        except OSError:
-            file_size = -1
-        try:
-            with open(path, "r") as fh:
-                cfg = yaml.safe_load(fh)
-        except FileNotFoundError as e:
-            logger.error("Config file not found: %s", path)
-            raise ConfigError(f"Config file not found: {path}") from e
-        except yaml.YAMLError as e:
-            logger.error("YAML parse failure in %s: %s", path, e)
-            raise ConfigError(f"Invalid YAML in {path}: {e}") from e
-
-        if not isinstance(cfg, dict):
-            raise ConfigError(f"Config at {path} did not parse to a mapping.")
-
-        logger.debug(
-            "load_config: parsed %s (%s on disk); top-level keys=%s",
-            path, _human_bytes(file_size) if file_size >= 0 else "?",
-            sorted(cfg.keys()),
+        self.log.debug(
+            "Config received: top-level keys=%s", sorted(config.keys())
         )
-
-        # An optional in-YAML toggle. CLI --debug always wins (set in __init__)
-        # but a YAML `debug: true` lets jobs opt in without command-line flags.
-        if not self.debug and bool(cfg.get("debug", False)):
-            self.debug = True
-            logger.debug("debug=true read from YAML; switching debug mode on")
-
-        self.config = cfg
-        logger.info("Config file read completed: %s", path)
-
         # Debug-mode dumps the *entire* configuration, with secrets masked.
         if self.debug:
             try:
-                dump = yaml.safe_dump(redact(cfg), sort_keys=False).rstrip()
+                dump = json.dumps(redact(config), indent=2, default=str)
             except Exception as e:  # noqa: BLE001
                 dump = f"<could not dump config: {e}>"
-            logger.debug("Effective configuration (redacted):\n%s", dump)
-        return cfg
-
-    # NOTE: Schema validation has been moved to runner.validate_config.
-    # This class only reads/parses YAML; the runner is the orchestrator
-    # that decides what a "valid" config looks like.
-
-    def _require_config(self) -> dict:
-        """Internal guard: ensures load_config() was called before use."""
-        if self.config is None:
-            raise ConfigError(
-                "Config not loaded. Call load_config() before this method."
-            )
-        return self.config
+            self.log.debug("Effective configuration (redacted):\n%s", dump)
 
     # --------------------------------------------------------------- secrets
 
-    @staticmethod
     def get_secret_from_aws(
-        secret_name: str, region: Optional[str] = None
+        self, secret_name: str, region: Optional[str] = None
     ) -> dict:
         """Fetch a secret from AWS Secrets Manager and return it as a dict.
 
@@ -290,7 +256,7 @@ class OracleToS3Extract:
 
         Raises SecretsManagerError on any failure.
         """
-        logger.info(
+        self.log.info(
             "Fetching secret '%s' from AWS Secrets Manager (region=%s)",
             secret_name, region or "<default>",
         )
@@ -300,7 +266,7 @@ class OracleToS3Extract:
             client = session.client("secretsmanager")
             response = client.get_secret_value(SecretId=secret_name)
         except (BotoCoreError, ClientError) as e:
-            logger.error(
+            self.log.error(
                 "Secrets Manager fetch failed for '%s': %s", secret_name, e
             )
             raise SecretsManagerError(
@@ -321,7 +287,7 @@ class OracleToS3Extract:
                 f"Secret '{secret_name}' is not valid JSON: {e}"
             ) from e
 
-        logger.debug(
+        self.log.debug(
             "Secrets Manager fetch OK in %.3fs (arn=%s, version=%s, keys=%s)",
             time.monotonic() - t0,
             response.get("ARN", "<?>"),
@@ -335,8 +301,7 @@ class OracleToS3Extract:
 
         Raises ConfigError or SecretsManagerError on failure.
         """
-        cfg = self._require_config()
-        oracle_cfg = cfg["oracle"]
+        oracle_cfg = self.config["oracle"]
         method = str(oracle_cfg.get("auth_method", "plain")).lower()
 
         if method == "plain":
@@ -360,18 +325,16 @@ class OracleToS3Extract:
         """Step 2: establish the Oracle connection.
 
         Raises OracleConnectionError on driver/network failure.
-        Raises ConfigError if load_config() was not called first.
         Raises SecretsManagerError on credential fetch failure.
         """
-        cfg = self._require_config()
         user, password = self._resolve_credentials()
-        dsn = cfg["oracle"]["dsn"]
-        method = str(cfg["oracle"].get("auth_method", "plain")).lower()
-        logger.info(
+        dsn = self.config["oracle"]["dsn"]
+        method = str(self.config["oracle"].get("auth_method", "plain")).lower()
+        self.log.info(
             "Connecting to Oracle dsn=%s as user=%s (auth_method=%s)",
             dsn, user, method,
         )
-        logger.debug(
+        self.log.debug(
             "oracledb thin_mode=%s, client_version=%s",
             getattr(oracledb, "is_thin_mode", lambda: True)(),
             getattr(oracledb, "clientversion", lambda: "thin")(),
@@ -389,13 +352,13 @@ class OracleToS3Extract:
                 instance = self.connection.instance_name  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001
                 instance = "<unknown>"
-            logger.info(
+            self.log.info(
                 "Oracle connection established in %.3fs "
                 "(server_version=%s, instance=%s)",
                 elapsed, server_version, instance,
             )
             if self.debug:
-                logger.debug(
+                self.log.debug(
                     "Connection details: autocommit=%s, encoding=%s, "
                     "stmtcachesize=%s, dsn=%s",
                     getattr(self.connection, "autocommit", "?"),
@@ -405,13 +368,13 @@ class OracleToS3Extract:
                 )
             return self.connection
         except oracledb.Error as e:
-            logger.error(
+            self.log.error(
                 "Oracle connection failed after %.3fs: %s",
                 time.monotonic() - t0, e,
             )
             raise OracleConnectionError(f"Oracle connection failed: {e}") from e
         except Exception as e:
-            logger.exception(
+            self.log.exception(
                 "Unexpected error establishing Oracle connection after %.3fs",
                 time.monotonic() - t0,
             )
@@ -422,15 +385,15 @@ class OracleToS3Extract:
     def close(self) -> None:
         """Close the Oracle connection if it is open. Safe to call multiple times."""
         if self.connection is not None:
-            logger.debug("close: tearing down Oracle connection")
+            self.log.debug("close: tearing down Oracle connection")
             try:
                 self.connection.close()
-                logger.info("Oracle connection closed.")
+                self.log.info("Oracle connection closed.")
             except Exception as e:  # noqa: BLE001
-                logger.warning("Error closing Oracle connection: %s", e)
+                self.log.warning("Error closing Oracle connection: %s", e)
             self.connection = None
         else:
-            logger.debug("close: no active Oracle connection to close")
+            self.log.debug("close: no active Oracle connection to close")
 
     # ---------------------------------------------------------------- query
 
@@ -441,23 +404,21 @@ class OracleToS3Extract:
         chunks of `fetch.array_size` rows. The writer consumes the
         batches lazily.
 
-        Raises ConfigError if load_config() was not called.
         Raises OracleConnectionError if connect() was not called.
         Raises OracleQueryError on cursor / fetch failures.
         """
-        cfg = self._require_config()
         if self.connection is None:
             raise OracleConnectionError(
                 "Call connect() before execute_query()."
             )
 
-        sql = cfg["sql"]
-        array_size = int(cfg.get("fetch", {}).get("array_size", 5000))
+        sql = self.config["sql"]
+        array_size = int(self.config.get("fetch", {}).get("array_size", 5000))
 
         # In debug mode log the full SQL; otherwise log the first non-empty
         # line to avoid spamming production logs with large multi-line queries.
         if self.debug:
-            logger.debug(
+            self.log.debug(
                 "execute_query: full SQL (arraysize=%s):\n%s",
                 array_size, sql,
             )
@@ -466,7 +427,7 @@ class OracleToS3Extract:
                 (line.strip() for line in sql.splitlines() if line.strip()),
                 "<empty>",
             )
-            logger.info(
+            self.log.info(
                 "Executing query (arraysize=%s, first line: %s)",
                 array_size, first_line,
             )
@@ -480,7 +441,7 @@ class OracleToS3Extract:
             except AttributeError:
                 pass
 
-            logger.debug(
+            self.log.debug(
                 "Cursor configured (arraysize=%s, prefetchrows=%s)",
                 array_size,
                 getattr(cursor, "prefetchrows", "?"),
@@ -489,7 +450,7 @@ class OracleToS3Extract:
             cursor.execute(sql)
             description = cursor.description or []
             column_names = [d[0] for d in description]
-            logger.info(
+            self.log.info(
                 "Query prepared in %.3fs (%d columns)",
                 time.monotonic() - prepare_t0, len(column_names),
             )
@@ -501,14 +462,14 @@ class OracleToS3Extract:
                     precision = d[4] if len(d) > 4 else None
                     scale = d[5] if len(d) > 5 else None
                     nullable = d[6] if len(d) > 6 else None
-                    logger.debug(
+                    self.log.debug(
                         "  column: name=%s type=%s size=%s precision=%s "
                         "scale=%s nullable=%s",
                         name, getattr(type_obj, "name", type_obj),
                         internal_size, precision, scale, nullable,
                     )
         except oracledb.Error as e:
-            logger.error("Query failed during prepare/execute: %s", e)
+            self.log.error("Query failed during prepare/execute: %s", e)
             raise OracleQueryError(f"Failed to execute query: {e}") from e
 
         rows_total = 0
@@ -520,7 +481,7 @@ class OracleToS3Extract:
                 try:
                     batch = cursor.fetchmany(array_size)
                 except oracledb.Error as e:
-                    logger.error(
+                    self.log.error(
                         "fetchmany failed after %d rows / %d batches: %s",
                         rows_total, batches_total, e,
                     )
@@ -533,14 +494,14 @@ class OracleToS3Extract:
                 rows_total += len(batch)
                 # Per-batch DEBUG; periodic INFO every ~10 batches so even
                 # non-debug runs get a heartbeat for very large extracts.
-                logger.debug(
+                self.log.debug(
                     "Fetched batch #%d (%d rows in %.3fs); running total=%d",
                     batches_total, len(batch),
                     time.monotonic() - batch_t0, rows_total,
                 )
                 if batches_total % 10 == 0:
                     elapsed = time.monotonic() - fetch_start
-                    logger.info(
+                    self.log.info(
                         "Fetched %d rows in %d batches (%.1fs, %s)",
                         rows_total, batches_total, elapsed,
                         _rate(rows_total, elapsed),
@@ -551,7 +512,7 @@ class OracleToS3Extract:
             self.metrics["rows_total"] = rows_total
             self.metrics["batches_total"] = batches_total
             self.metrics["elapsed_query_s"] = elapsed
-            logger.info(
+            self.log.info(
                 "Query streaming complete: %d row(s) in %d batch(es), "
                 "elapsed=%.3fs (%s)",
                 rows_total, batches_total, elapsed,
@@ -559,9 +520,9 @@ class OracleToS3Extract:
             )
             try:
                 cursor.close()
-                logger.debug("Cursor closed.")
+                self.log.debug("Cursor closed.")
             except Exception as e:  # noqa: BLE001
-                logger.debug("Error closing cursor (ignored): %s", e)
+                self.log.debug("Error closing cursor (ignored): %s", e)
 
     # --------------------------------------------------------------- writing
 
@@ -574,11 +535,9 @@ class OracleToS3Extract:
         records_per_file. File names follow <base>_<n>.csv (1-indexed).
         Returns the list of file paths written.
 
-        Raises ConfigError if load_config() was not called.
         Raises CSVWriteError on filesystem errors.
         """
-        cfg = self._require_config()
-        out_cfg = cfg["output"]
+        out_cfg = self.config["output"]
         local_dir = Path(out_cfg["local_dir"])
         base = out_cfg["base_filename"]
         records_per_file = int(out_cfg["records_per_file"])
@@ -587,7 +546,7 @@ class OracleToS3Extract:
         include_header = csv_cfg.get("include_header", True)
         quote_all = csv_cfg.get("quote_all", False)
 
-        logger.info(
+        self.log.info(
             "write_csv_files: dir=%s base=%s records_per_file=%d "
             "delimiter=%r include_header=%s quote_all=%s",
             local_dir, base, records_per_file,
@@ -596,9 +555,9 @@ class OracleToS3Extract:
 
         try:
             local_dir.mkdir(parents=True, exist_ok=True)
-            logger.debug("Ensured local_dir exists: %s", local_dir.resolve())
+            self.log.debug("Ensured local_dir exists: %s", local_dir.resolve())
         except OSError as e:
-            logger.error("Could not create local_dir %s: %s", local_dir, e)
+            self.log.error("Could not create local_dir %s: %s", local_dir, e)
             raise CSVWriteError(
                 f"Could not create local_dir {local_dir}: {e}"
             ) from e
@@ -621,7 +580,7 @@ class OracleToS3Extract:
             try:
                 file_handle = open(path, "w", newline="", encoding="utf-8")
             except OSError as e:
-                logger.error("Could not open %s for writing: %s", path, e)
+                self.log.error("Could not open %s for writing: %s", path, e)
                 raise CSVWriteError(f"Could not open {path}: {e}") from e
             writer = csv.writer(
                 file_handle,
@@ -630,14 +589,14 @@ class OracleToS3Extract:
             )
             if include_header and column_names is not None:
                 writer.writerow(column_names)
-                logger.debug(
+                self.log.debug(
                     "Wrote header row to %s (%d columns)",
                     path.name, len(column_names),
                 )
             files.append(path)
             per_file_rows.append(0)
             rows_in_current = 0
-            logger.info("Opened new output file: %s", path)
+            self.log.info("Opened new output file: %s", path)
             return path
 
         def close_current_file() -> None:
@@ -648,7 +607,7 @@ class OracleToS3Extract:
                     file_handle.flush()
                     file_handle.close()
                 except Exception as e:  # noqa: BLE001
-                    logger.warning(
+                    self.log.warning(
                         "Error closing file %s: %s",
                         files[-1] if files else "<unknown>", e,
                     )
@@ -656,7 +615,7 @@ class OracleToS3Extract:
                 size = _safe_file_size(files[-1])
                 if size >= 0:
                     self.metrics["bytes_written"] += size
-                    logger.info(
+                    self.log.info(
                         "Closed %s (%d row(s), %s)",
                         files[-1].name,
                         per_file_rows[-1] if per_file_rows else 0,
@@ -675,7 +634,7 @@ class OracleToS3Extract:
                     try:
                         writer.writerow(row)
                     except (OSError, csv.Error) as e:
-                        logger.error(
+                        self.log.error(
                             "Row write failure (file=%s, row#%d): %s",
                             files[-1] if files else "<unknown>",
                             rows_total + 1, e,
@@ -694,7 +653,7 @@ class OracleToS3Extract:
                 now = time.monotonic()
                 if now - last_progress_log >= 5.0:
                     elapsed = now - write_start
-                    logger.info(
+                    self.log.info(
                         "Write progress: %d row(s) across %d file(s) "
                         "(%.1fs, %s)",
                         rows_total, len(files), elapsed,
@@ -708,7 +667,7 @@ class OracleToS3Extract:
         self.local_files = files
         self.metrics["files_written"] = len(files)
         self.metrics["elapsed_write_s"] = elapsed
-        logger.info(
+        self.log.info(
             "Wrote %d file(s) totalling %s rows in %.3fs (%s); "
             "on-disk size=%s",
             len(files), rows_total, elapsed,
@@ -717,7 +676,7 @@ class OracleToS3Extract:
         )
         if self.debug:
             for p, n in zip(files, per_file_rows):
-                logger.debug(
+                self.log.debug(
                     "  file=%s rows=%d size=%s",
                     p, n, _human_bytes(_safe_file_size(p)),
                 )
@@ -729,23 +688,21 @@ class OracleToS3Extract:
         """Step 5: upload local CSV files to S3 with optional SSE-KMS encryption.
 
         Returns the list of s3:// URIs uploaded.
-        Raises ConfigError if load_config() was not called.
         Raises S3UploadError on the first failed upload.
         """
-        cfg = self._require_config()
-        s3_cfg = cfg["s3"]
+        s3_cfg = self.config["s3"]
         bucket = s3_cfg["bucket"]
         prefix = str(s3_cfg.get("prefix", "")).lstrip("/")
         kms_key_id = s3_cfg.get("kms_key_id")
         region = s3_cfg.get("aws_region")
 
-        logger.info(
+        self.log.info(
             "upload_to_s3: bucket=%s prefix=%s region=%s kms=%s",
             bucket, prefix or "<none>", region or "<default>",
             "enabled" if kms_key_id else "disabled",
         )
         if self.debug and kms_key_id:
-            logger.debug(
+            self.log.debug(
                 "SSE-KMS will be applied to every object (key id length=%d)",
                 len(str(kms_key_id)),
             )
@@ -753,13 +710,13 @@ class OracleToS3Extract:
         try:
             session = boto3.session.Session(region_name=region)
             s3 = session.client("s3")
-            logger.debug(
+            self.log.debug(
                 "S3 client created (boto3=%s, region=%s)",
                 getattr(boto3, "__version__", "?"),
                 session.region_name or "<default>",
             )
         except (BotoCoreError, ClientError) as e:
-            logger.error("Failed to create S3 client: %s", e)
+            self.log.error("Failed to create S3 client: %s", e)
             raise S3UploadError(f"Failed to create S3 client: {e}") from e
 
         uris: List[str] = []
@@ -772,7 +729,7 @@ class OracleToS3Extract:
             if kms_key_id:
                 extra["ServerSideEncryption"] = "aws:kms"
                 extra["SSEKMSKeyId"] = kms_key_id
-            logger.info(
+            self.log.info(
                 "Uploading [%d/%d] %s (%s) -> s3://%s/%s",
                 idx, len(files_list), path.name,
                 _human_bytes(size) if size >= 0 else "?",
@@ -792,12 +749,12 @@ class OracleToS3Extract:
                     if size >= 0 and elapsed > 0
                     else "?"
                 )
-                logger.info(
+                self.log.info(
                     "Uploaded %s -> %s in %.3fs (%s)",
                     path.name, uri, elapsed, throughput,
                 )
             except (BotoCoreError, ClientError, OSError) as e:
-                logger.error(
+                self.log.error(
                     "Upload failed for %s -> s3://%s/%s after %.3fs: %s",
                     path, bucket, key, time.monotonic() - t0, e,
                 )
@@ -807,7 +764,7 @@ class OracleToS3Extract:
 
         elapsed_total = time.monotonic() - upload_start
         self.metrics["elapsed_upload_s"] = elapsed_total
-        logger.info(
+        self.log.info(
             "S3 upload phase complete: %d file(s), %s in %.3fs",
             len(uris),
             _human_bytes(self.metrics["bytes_uploaded"]),
@@ -821,12 +778,11 @@ class OracleToS3Extract:
         Honors the optional `cleanup_local` flag in the YAML (default true).
         Best-effort: logs a warning on per-file failure, does not raise.
         """
-        cfg = self._require_config()
-        if not bool(cfg.get("cleanup_local", True)):
-            logger.info("cleanup_local=false; keeping local files.")
+        if not bool(self.config.get("cleanup_local", True)):
+            self.log.info("cleanup_local=false; keeping local files.")
             if self.debug:
                 for p in files:
-                    logger.debug("  retained local file: %s", p)
+                    self.log.debug("  retained local file: %s", p)
             return
         deleted = 0
         for path in files:
@@ -834,13 +790,13 @@ class OracleToS3Extract:
                 size = _safe_file_size(path)
                 path.unlink()
                 deleted += 1
-                logger.info(
+                self.log.info(
                     "Deleted local file %s%s", path,
                     f" ({_human_bytes(size)})" if size >= 0 else "",
                 )
             except OSError as e:
-                logger.warning("Could not delete %s: %s", path, e)
-        logger.info("cleanup_local complete: %d file(s) deleted.", deleted)
+                self.log.warning("Could not delete %s: %s", path, e)
+        self.log.info("cleanup_local complete: %d file(s) deleted.", deleted)
 
     # ------------------------------------------------------------- diagnostics
 
@@ -851,7 +807,7 @@ class OracleToS3Extract:
         metrics were accumulated so far.
         """
         m = self.metrics
-        logger.info(
+        self.log.info(
             "Run summary: rows=%s, batches=%s, files=%s, "
             "written=%s, uploaded=%s/%d files, "
             "timings: query=%.2fs write=%.2fs upload=%.2fs",
@@ -861,4 +817,4 @@ class OracleToS3Extract:
             m["elapsed_query_s"], m["elapsed_write_s"], m["elapsed_upload_s"],
         )
         if self.debug:
-            logger.debug("Full metrics dump: %s", m)
+            self.log.debug("Full metrics dump: %s", m)

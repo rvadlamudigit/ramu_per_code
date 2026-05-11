@@ -78,13 +78,26 @@ Or use it as a library:
 
 ```python
 from oracle_to_s3 import OracleToS3Extract
-from runner import validate_config
+from logger import LoggerClient
+from runner import read_yaml, validate_config
 
-job = OracleToS3Extract("config/my_extract.yaml")
+# Step 1a/1b: runner reads + validates YAML
+cfg = read_yaml("config/my_extract.yaml")
+validate_config(cfg)
 
-# Step-by-step (useful for testing or custom flows):
-cfg     = job.load_config()        # Step 1a: read + parse YAML
-validate_config(cfg)               # Step 1b: schema check (runner-owned)
+# Step 1c: build the LoggerClient (`lc`)
+lc = LoggerClient(
+    project_name="oracle_framework",
+    process_name="big_table_extract",
+    root_directory="/var/log/oracle_framework",
+    logoutput="BOTH",
+)
+lc.attach_to_root()  # so boto3/oracledb stdlib loggers flow through lc too
+
+# Step 1d: build the framework class with logger + config
+job = OracleToS3Extract(lc, cfg)
+
+# Steps 2-6
 job.connect()
 batches = job.execute_query()      # generator
 files   = job.write_csv_files(batches)
@@ -93,11 +106,11 @@ job.cleanup_local(files)
 job.close()
 ```
 
-> Schema validation lives in `runner.py` (`validate_config`), not in the
-> `OracleToS3Extract` class. The framework class is a pure toolkit; the
-> runner owns orchestration and validation. Library callers that
-> bypass the runner should call `validate_config(cfg)` themselves
-> immediately after `load_config()`.
+> The framework class is a pure toolkit. The runner owns YAML reading
+> (`read_yaml`), schema validation (`validate_config`), and LoggerClient
+> construction (`make_logger`). The class receives the logger and the
+> already-parsed config dict in its constructor and never touches the
+> filesystem or `logging.basicConfig` itself.
 
 ## YAML reference
 

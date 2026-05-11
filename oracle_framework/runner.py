@@ -1,23 +1,32 @@
 """
 runner.py -- CLI entry point for the Oracle -> S3 extract framework.
 
-Drives the toolkit and integrates two utility modules:
+Drives the toolkit and OWNS:
 
-  - logger.py     LoggerClient is wired up if the YAML config contains a
-                  `logging:` section. Its handlers are attached to the
-                  root logger so the framework's `logging.getLogger(...)`
-                  calls flow into the same files / stream.
+  - YAML reading                  read_yaml()  reads & parses the file.
+  - YAML schema validation        validate_config()  checks the schema.
+  - LoggerClient construction     make_logger() builds `lc`, the single
+                                  LoggerClient instance that the entire
+                                  pipeline logs through. Handlers are
+                                  attached to the root logger so any
+                                  stdlib `logging.getLogger(...)` call
+                                  (boto3, oracledb, our own bootstrap)
+                                  flows into the same files / stream.
+  - Class construction            OracleToS3Extract(lc, cfg, debug=...)
+                                  is built with the logger AND the
+                                  parsed config dict; the class never
+                                  reads files itself.
 
-  - sdc_email.py  SdcAlertUtil is used to send success and/or failure
-                  notifications if the YAML config contains a
-                  `notifications:` section. Notifications are
-                  best-effort: a notification failure is logged but does
-                  not change the program's exit code.
+  - sdc_email.py SdcAlertUtil is used to send success and/or failure
+    notifications if the YAML config contains a `notifications:` section.
+    Notifications are best-effort: a notification failure is logged but
+    does not change the program's exit code.
 
 Pipeline:
-    Step 1a load_config         -- read & parse YAML, return dict
-    Step 1b validate_config     -- schema check (lives in this runner;
-                                   raises ConfigError on any violation)
+    Step 1a read_yaml           -- read & parse YAML, return dict
+    Step 1b validate_config     -- schema check (raises ConfigError)
+    Step 1c make_logger         -- build `lc` (LoggerClient)
+    Step 1d build job           -- OracleToS3Extract(lc, cfg, debug=...)
     Step 2  connect             -- open Oracle connection
     Step 3  execute_query       -- generator over result batches
     Step 4  write_csv_files     -- chunked CSV files on local disk
@@ -40,6 +49,8 @@ import sys
 import time
 import traceback
 from typing import List, Optional
+
+import yaml
 
 from oracle_to_s3 import (
     OracleToS3Extract,
@@ -115,6 +126,43 @@ def parse_args() -> argparse.Namespace:
              "lines. Also forces DEBUG-level on every handler.",
     )
     return parser.parse_args()
+
+
+# --------------------------------------------------------------- yaml reading
+
+def read_yaml(path: str) -> dict:
+    """Step 1a: read the YAML config from disk and return a dict.
+
+    The runner -- not the framework class -- owns file I/O. Raises
+    ConfigError on missing file, invalid YAML, or a non-mapping root.
+    """
+    log = logging.getLogger("runner")
+    log.debug("read_yaml: opening %s", path)
+    try:
+        file_size = os.path.getsize(path)
+    except OSError:
+        file_size = -1
+    try:
+        with open(path, "r") as fh:
+            cfg = yaml.safe_load(fh)
+    except FileNotFoundError as e:
+        log.error("Config file not found: %s", path)
+        raise ConfigError(f"Config file not found: {path}") from e
+    except yaml.YAMLError as e:
+        log.error("YAML parse failure in %s: %s", path, e)
+        raise ConfigError(f"Invalid YAML in {path}: {e}") from e
+
+    if not isinstance(cfg, dict):
+        raise ConfigError(f"Config at {path} did not parse to a mapping.")
+
+    log.debug(
+        "read_yaml: parsed %s (%s on disk); top-level keys=%s",
+        path,
+        f"{file_size} B" if file_size >= 0 else "?",
+        sorted(cfg.keys()),
+    )
+    log.info("Config file read completed: %s", path)
+    return cfg
 
 
 # --------------------------------------------------------- config validation
@@ -217,16 +265,20 @@ def _log_runtime_environment(log: logging.Logger) -> None:
 
 # --------------------------------------------------------- logger integration
 
-def configure_logger_from_yaml(
-    config: dict, verbose: bool = False, debug: bool = False
-) -> Optional[LoggerClient]:
-    """If YAML has a `logging:` section, build LoggerClient and attach
-    its handlers to the root logger. Returns the LoggerClient (or None
-    if the section is absent).
+def make_logger(
+    config: dict, *, verbose: bool = False, debug: bool = False
+) -> LoggerClient:
+    """Step 1c: build the LoggerClient ('lc') used by the rest of the run.
 
-    When debug=True the LoggerClient is constructed in debug mode, which
-    forces every handler (stream + files) to DEBUG and uses a richer
-    formatter that includes module/line info.
+    Always returns a LoggerClient -- this is the single place where the
+    runner instantiates ``logger.py``. If the YAML has a ``logging:``
+    section, it drives project/process names, root_directory and output
+    mode; otherwise we default to STDOUT only so the class still gets a
+    real ``lc`` object.
+
+    `lc.attach_to_root()` is called so that any module using stdlib
+    ``logging.getLogger(...)`` -- boto3, oracledb, our own bootstrap
+    code -- flows through the same handlers.
 
     Expected YAML:
         logging:
@@ -235,35 +287,44 @@ def configure_logger_from_yaml(
           root_directory:  /var/log/oracle_framework
           output:          BOTH        # STDOUT | LOGFILE | BOTH
     """
-    log_cfg = config.get("logging")
-    if not log_cfg:
-        logging.getLogger("runner").debug(
-            "No `logging:` section in YAML; staying on stdlib basicConfig."
-        )
-        return None
+    log_cfg = config.get("logging") or {}
 
-    lf = LoggerClient(
+    # Default output: STDOUT if no logging: section, BOTH otherwise.
+    default_output = "BOTH" if log_cfg else "STDOUT"
+    output = str(log_cfg.get("output", default_output)).upper()
+
+    # If files were requested but no root_directory supplied, gracefully
+    # fall back to STDOUT instead of raising -- the runner is still
+    # responsible for producing logs even when YAML is light.
+    if output != "STDOUT" and not log_cfg.get("root_directory"):
+        logging.getLogger("runner").warning(
+            "logging.output=%s requested but no root_directory set; "
+            "falling back to STDOUT only.", output,
+        )
+        output = "STDOUT"
+
+    lc = LoggerClient(
         project_name=log_cfg.get("project_name", "oracle_framework"),
         process_name=log_cfg.get("process_name", "extract"),
         root_directory=log_cfg.get("root_directory"),
-        logoutput=str(log_cfg.get("output", "BOTH")).upper(),
+        logoutput=output,
         debug=debug,
     )
-    lf.attach_to_root()
+    lc.attach_to_root()
     if verbose or debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    lf.logfile.info(
+    lc.logfile.info(
         "LoggerClient initialized; output=%s, debug=%s",
-        lf.logoutput, debug,
+        lc.logoutput, debug,
     )
-    if lf.log_file:
-        lf.logfile.info(
+    if lc.log_file:
+        lc.logfile.info(
             "Log files: %s.log / %s.error / %s.critical%s",
-            lf.log_file, lf.log_file, lf.log_file,
-            f" / {lf.log_file}.debug" if debug else "",
+            lc.log_file, lc.log_file, lc.log_file,
+            f" / {lc.log_file}.debug" if debug else "",
         )
-    return lf
+    return lc
 
 
 # -------------------------------------------------------- email notifications
@@ -401,11 +462,11 @@ def run_pipeline(job: OracleToS3Extract) -> List[str]:
 
 # --------------------------------------------------------------------- main --
 
-def _log_file_for_attachment(lf: Optional[LoggerClient]) -> Optional[str]:
+def _log_file_for_attachment(lc: Optional[LoggerClient]) -> Optional[str]:
     """Return the .log file path for email attachment, or None."""
-    if lf is None or not lf.log_file:
+    if lc is None or not lc.log_file:
         return None
-    return f"{lf.log_file}.log"
+    return f"{lc.log_file}.log"
 
 
 def _handle_error(
@@ -413,11 +474,13 @@ def _handle_error(
     exit_code: int,
     label: str,
     config: Optional[dict],
-    lf: Optional[LoggerClient],
+    lc: Optional[LoggerClient],
     verbose: bool = False,
     debug: bool = False,
 ) -> int:
-    log = logging.getLogger("runner")
+    # If lc is up, log through it; otherwise fall back to the bootstrap
+    # stdlib runner logger.
+    log = lc.logfile if lc is not None else logging.getLogger("runner")
     print(f"[ERROR] {label}: {error}", file=sys.stderr)
     # In --debug or --verbose, ALWAYS dump the chained traceback so the
     # user sees the original exception too (chained via `raise ... from e`).
@@ -428,13 +491,17 @@ def _handle_error(
     send_notification(
         config, "on_failure",
         error=error,
-        log_file_path=_log_file_for_attachment(lf),
+        log_file_path=_log_file_for_attachment(lc),
     )
     return exit_code
 
 
 def main() -> int:
     args = parse_args()
+    # Bootstrap stdlib logging only for the few lines that run BEFORE the
+    # LoggerClient is built (read_yaml / validate_config). After lc is
+    # created, lc.attach_to_root() takes over and any stdlib log call
+    # flows through LoggerClient handlers.
     setup_basic_logging(args.verbose, debug=args.debug)
     log = logging.getLogger("runner")
 
@@ -444,25 +511,29 @@ def main() -> int:
 
     overall_start = time.monotonic()
     config: Optional[dict] = None
-    lf: Optional[LoggerClient] = None
+    lc: Optional[LoggerClient] = None
 
     # ============================ MAIN EXCEPTION BLOCK ===========================
     try:
-        # Step 1: build job and load config
-        job = OracleToS3Extract(args.config, debug=args.debug)
-        log.info("Step 1/6: loading YAML config from %s ...", args.config)
-        config = job.load_config()
+        # Step 1a: read the YAML file (runner-owned).
+        log.info("Step 1/6: reading YAML config from %s ...", args.config)
+        config = read_yaml(args.config)
         log.info("Loaded config sections: %s", sorted(config.keys()))
 
-        # Step 1b: schema validation (lives in the runner, not the framework).
+        # Step 1b: schema validation (runner-owned).
         log.info("Step 1/6: validating config schema ...")
         validate_config(config)
         log.info("Config validation passed.")
 
-        # Switch to LoggerClient if YAML configures it
-        lf = configure_logger_from_yaml(
-            config, verbose=args.verbose, debug=args.debug or job.debug,
-        )
+        # Step 1c: build the LoggerClient. The YAML's `debug: true` is
+        # honoured here too, so a config-only debug request reaches lc.
+        debug_on = bool(args.debug) or bool(config.get("debug", False))
+        lc = make_logger(config, verbose=args.verbose, debug=debug_on)
+        log = lc.logfile  # everything from here on logs through lc
+
+        # Step 1d: build the framework class with the logger and the
+        # already-validated config dict.
+        job = OracleToS3Extract(lc, config, debug=debug_on)
 
         # Steps 2-6
         uris = run_pipeline(job)
@@ -483,45 +554,45 @@ def main() -> int:
         send_notification(
             config, "on_success",
             files=uris,
-            log_file_path=_log_file_for_attachment(lf),
+            log_file_path=_log_file_for_attachment(lc),
         )
         return EXIT_OK
 
     except ConfigError as e:
         return _handle_error(
             e, EXIT_CONFIG, "Configuration error",
-            config, lf, args.verbose, args.debug,
+            config, lc, args.verbose, args.debug,
         )
     except SecretsManagerError as e:
         return _handle_error(
             e, EXIT_SECRETS, "AWS Secrets Manager error",
-            config, lf, args.verbose, args.debug,
+            config, lc, args.verbose, args.debug,
         )
     except OracleConnectionError as e:
         return _handle_error(
             e, EXIT_ORACLE_CONNECT, "Oracle connection error",
-            config, lf, args.verbose, args.debug,
+            config, lc, args.verbose, args.debug,
         )
     except OracleQueryError as e:
         return _handle_error(
             e, EXIT_ORACLE_QUERY, "Oracle query error",
-            config, lf, args.verbose, args.debug,
+            config, lc, args.verbose, args.debug,
         )
     except CSVWriteError as e:
         return _handle_error(
             e, EXIT_CSV, "CSV write error",
-            config, lf, args.verbose, args.debug,
+            config, lc, args.verbose, args.debug,
         )
     except S3UploadError as e:
         return _handle_error(
             e, EXIT_S3, "S3 upload error",
-            config, lf, args.verbose, args.debug,
+            config, lc, args.verbose, args.debug,
         )
     except OracleToS3ExtractError as e:
         # Fallback for any new framework exception subclass.
         return _handle_error(
             e, EXIT_GENERIC, "Extract failed",
-            config, lf, args.verbose, args.debug,
+            config, lc, args.verbose, args.debug,
         )
 
     except KeyboardInterrupt:
@@ -542,7 +613,7 @@ def main() -> int:
         send_notification(
             config, "on_failure",
             error=e,
-            log_file_path=_log_file_for_attachment(lf),
+            log_file_path=_log_file_for_attachment(lc),
         )
         return EXIT_UNEXPECTED
 

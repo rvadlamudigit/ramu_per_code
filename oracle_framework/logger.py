@@ -102,7 +102,12 @@ class LoggerClient(object):
             except Exception:  # noqa: BLE001
                 pass
         log.propagate = False
+        # The logger itself stays open at DEBUG so individual handlers
+        # decide what to emit. The handler-level filter (below) controls
+        # what actually shows up.
         log.setLevel(logging.DEBUG)
+        # Effective handler level: DEBUG only when debug=True, else INFO.
+        handler_level = logging.DEBUG if self.debug else logging.INFO
 
         # Standard formatter (production-friendly, single-line).
         log_formatter = logging.Formatter(
@@ -130,7 +135,7 @@ class LoggerClient(object):
         if self.logoutput in ("STDOUT", "BOTH"):
             sh = logging.StreamHandler()
             sh.setFormatter(active_formatter)
-            sh.setLevel(logging.DEBUG)
+            sh.setLevel(handler_level)
             log.addHandler(sh)
 
         if self.logoutput == "STDOUT":
@@ -141,7 +146,7 @@ class LoggerClient(object):
             f"{self.log_file}.log", mode="w", encoding="utf-8"
         )
         fh_main.setFormatter(active_formatter)
-        fh_main.setLevel(logging.DEBUG)
+        fh_main.setLevel(handler_level)
         log.addHandler(fh_main)
 
         fh_error = logging.FileHandler(
@@ -157,6 +162,8 @@ class LoggerClient(object):
         fh_critical.setFormatter(active_formatter)
         fh_critical.setLevel(logging.CRITICAL)
         log.addHandler(fh_critical)
+        # NOTE: .critical is intentionally a CRITICAL-only sink so it is
+        # always small. Independent of the debug flag.
 
         # Debug-only firehose file. Keeps DEBUG noise out of the main .log
         # for consumers that already pipe .log to ops dashboards.
@@ -190,7 +197,10 @@ class LoggerClient(object):
                 pass
         for h in self.logfile.handlers:
             root.addHandler(h)
-        root.setLevel(logging.DEBUG)
+        # The root logger filters at the same level as the LoggerClient's
+        # handlers so non-debug runs aren't flooded with DEBUG noise from
+        # the framework or third-party modules.
+        root.setLevel(logging.DEBUG if self.debug else logging.INFO)
 
     def close(self) -> None:
         """Close all handlers attached to this logger."""
