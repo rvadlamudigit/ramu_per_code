@@ -15,7 +15,9 @@ Drives the toolkit and integrates two utility modules:
                   not change the program's exit code.
 
 Pipeline:
-    Step 1  load_config         -- read YAML, return dict
+    Step 1a load_config         -- read & parse YAML, return dict
+    Step 1b validate_config     -- schema check (lives in this runner;
+                                   raises ConfigError on any violation)
     Step 2  connect             -- open Oracle connection
     Step 3  execute_query       -- generator over result batches
     Step 4  write_csv_files     -- chunked CSV files on local disk
@@ -113,6 +115,82 @@ def parse_args() -> argparse.Namespace:
              "lines. Also forces DEBUG-level on every handler.",
     )
     return parser.parse_args()
+
+
+# --------------------------------------------------------- config validation
+
+def validate_config(cfg: dict) -> None:
+    """Validate the YAML config dict against the framework's schema.
+
+    Lives in the runner (not in oracle_to_s3.py) so that the framework
+    class stays a pure toolkit -- the runner is the single place that
+    decides what counts as a valid extract job.
+
+    Raises ConfigError on the first violation; logs a DEBUG line on
+    success summarising the key knobs that were checked.
+    """
+    log = logging.getLogger("runner")
+    log.debug("validate_config: checking required top-level keys")
+    if not isinstance(cfg, dict):
+        raise ConfigError("Config did not parse to a mapping.")
+
+    for key in ("oracle", "sql", "output", "s3"):
+        if key not in cfg:
+            raise ConfigError(f"Missing required config key: {key}")
+
+    oracle_cfg = cfg["oracle"]
+    if not isinstance(oracle_cfg, dict):
+        raise ConfigError("'oracle' section must be a mapping")
+    if "dsn" not in oracle_cfg:
+        raise ConfigError("oracle.dsn is required")
+
+    method = str(oracle_cfg.get("auth_method", "plain")).lower()
+    log.debug("validate_config: oracle.auth_method=%s", method)
+    if method == "plain":
+        if not oracle_cfg.get("user") or not oracle_cfg.get("password"):
+            raise ConfigError(
+                "auth_method 'plain' requires oracle.user and oracle.password"
+            )
+    elif method == "aws_secret":
+        if not oracle_cfg.get("secret_name"):
+            raise ConfigError(
+                "auth_method 'aws_secret' requires oracle.secret_name"
+            )
+    else:
+        raise ConfigError(
+            f"Unknown oracle.auth_method '{method}'; "
+            "expected 'plain' or 'aws_secret'"
+        )
+
+    out = cfg["output"]
+    if not isinstance(out, dict):
+        raise ConfigError("'output' section must be a mapping")
+    for k in ("local_dir", "base_filename", "records_per_file"):
+        if k not in out:
+            raise ConfigError(f"output.{k} is required")
+    try:
+        rpf = int(out["records_per_file"])
+    except (TypeError, ValueError) as e:
+        raise ConfigError(
+            f"output.records_per_file must be an integer, got "
+            f"{out['records_per_file']!r}"
+        ) from e
+    if rpf <= 0:
+        raise ConfigError("output.records_per_file must be > 0")
+
+    s3_cfg = cfg["s3"]
+    if not isinstance(s3_cfg, dict):
+        raise ConfigError("'s3' section must be a mapping")
+    if "bucket" not in s3_cfg:
+        raise ConfigError("s3.bucket is required")
+
+    log.debug(
+        "validate_config: OK (records_per_file=%s, bucket=%s, prefix=%s, "
+        "kms=%s)",
+        rpf, s3_cfg["bucket"],
+        s3_cfg.get("prefix") or "<none>",
+        "yes" if s3_cfg.get("kms_key_id") else "no",
+    )
 
 
 def _log_runtime_environment(log: logging.Logger) -> None:
@@ -375,6 +453,11 @@ def main() -> int:
         log.info("Step 1/6: loading YAML config from %s ...", args.config)
         config = job.load_config()
         log.info("Loaded config sections: %s", sorted(config.keys()))
+
+        # Step 1b: schema validation (lives in the runner, not the framework).
+        log.info("Step 1/6: validating config schema ...")
+        validate_config(config)
+        log.info("Config validation passed.")
 
         # Switch to LoggerClient if YAML configures it
         lf = configure_logger_from_yaml(

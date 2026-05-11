@@ -3,15 +3,17 @@ oracle_to_s3.py
 Reusable Oracle -> CSV -> S3 extraction framework.
 
 The class is a TOOLKIT of independent functions. The constructor only
-stores the config path; nothing is read or validated until the runner
-explicitly calls load_config(). Each public method does ONE thing and
-raises typed framework exceptions on failure -- it never prints or
-sys.exits. The runner program owns the orchestration order and the
-final exception handling.
+stores the config path; nothing is read until the runner explicitly
+calls load_config(). Each public method does ONE thing and raises typed
+framework exceptions on failure -- it never prints or sys.exits. The
+runner program owns the orchestration order, schema VALIDATION
+(see runner.validate_config), and the final exception handling.
 
 Exception hierarchy (all subclass OracleToS3ExtractError):
     OracleToS3ExtractError    -- base class for everything below
-        ConfigError           -- bad / missing YAML configuration
+        ConfigError           -- missing / unreadable / unparseable YAML
+                                 (also raised by runner.validate_config
+                                 for schema problems)
         SecretsManagerError   -- failed to fetch secret from AWS
         OracleConnectionError -- could not connect to Oracle
         OracleQueryError      -- query execution failed
@@ -19,9 +21,11 @@ Exception hierarchy (all subclass OracleToS3ExtractError):
         S3UploadError         -- failed to upload to S3
 
 Typical usage from a runner program:
+    from runner import validate_config
     job = OracleToS3Extract("config/extract_example.yaml")
     try:
-        config  = job.load_config()             # Step 1
+        cfg     = job.load_config()             # Step 1a: read YAML
+        validate_config(cfg)                    # Step 1b: schema check
         job.connect()                           # Step 2
         batches = job.execute_query()           # Step 3 (generator)
         files   = job.write_csv_files(batches)  # Step 4
@@ -199,18 +203,24 @@ class OracleToS3Extract:
     def load_config(self) -> dict:
         """Step 1: read the YAML config file and return it as a dict.
 
+        This method only reads, parses, and stores the YAML. **Schema
+        validation lives in the runner** (`runner.validate_config`) so
+        that orchestration concerns stay in the runner and the framework
+        class stays a pure toolkit. Library callers that bypass the
+        runner are expected to either call `runner.validate_config(cfg)`
+        themselves or accept that a malformed config will surface as a
+        KeyError / TypeError later in the pipeline.
+
         Side effects:
             - Stores the parsed dict on self.config so other methods can use it.
-            - Validates the schema; raises ConfigError on any problem.
             - Logs an INFO message when reading is complete.
 
         Returns:
             The parsed YAML as a Python dict (also returned to the runner
-            so the runner can inspect / log keys if it wants).
+            so the runner can inspect / log / validate it).
 
         Raises:
-            ConfigError on missing file, invalid YAML, non-mapping root,
-            or any schema violation.
+            ConfigError on missing file, invalid YAML, or a non-mapping root.
         """
         path = self.config_path
         logger.debug("load_config: opening %s", path)
@@ -243,7 +253,6 @@ class OracleToS3Extract:
             self.debug = True
             logger.debug("debug=true read from YAML; switching debug mode on")
 
-        self._validate_config(cfg)
         self.config = cfg
         logger.info("Config file read completed: %s", path)
 
@@ -256,51 +265,9 @@ class OracleToS3Extract:
             logger.debug("Effective configuration (redacted):\n%s", dump)
         return cfg
 
-    @staticmethod
-    def _validate_config(cfg: dict) -> None:
-        logger.debug("_validate_config: checking required top-level keys")
-        for key in ("oracle", "sql", "output", "s3"):
-            if key not in cfg:
-                raise ConfigError(f"Missing required config key: {key}")
-
-        oracle_cfg = cfg["oracle"]
-        if "dsn" not in oracle_cfg:
-            raise ConfigError("oracle.dsn is required")
-
-        method = str(oracle_cfg.get("auth_method", "plain")).lower()
-        logger.debug("_validate_config: oracle.auth_method=%s", method)
-        if method == "plain":
-            if not oracle_cfg.get("user") or not oracle_cfg.get("password"):
-                raise ConfigError(
-                    "auth_method 'plain' requires oracle.user and oracle.password"
-                )
-        elif method == "aws_secret":
-            if not oracle_cfg.get("secret_name"):
-                raise ConfigError(
-                    "auth_method 'aws_secret' requires oracle.secret_name"
-                )
-        else:
-            raise ConfigError(
-                f"Unknown oracle.auth_method '{method}'; "
-                "expected 'plain' or 'aws_secret'"
-            )
-
-        out = cfg["output"]
-        for k in ("local_dir", "base_filename", "records_per_file"):
-            if k not in out:
-                raise ConfigError(f"output.{k} is required")
-        if int(out["records_per_file"]) <= 0:
-            raise ConfigError("output.records_per_file must be > 0")
-
-        if "bucket" not in cfg["s3"]:
-            raise ConfigError("s3.bucket is required")
-        logger.debug(
-            "_validate_config: OK (records_per_file=%s, bucket=%s, prefix=%s, "
-            "kms=%s)",
-            out["records_per_file"], cfg["s3"]["bucket"],
-            cfg["s3"].get("prefix") or "<none>",
-            "yes" if cfg["s3"].get("kms_key_id") else "no",
-        )
+    # NOTE: Schema validation has been moved to runner.validate_config.
+    # This class only reads/parses YAML; the runner is the orchestrator
+    # that decides what a "valid" config looks like.
 
     def _require_config(self) -> dict:
         """Internal guard: ensures load_config() was called before use."""

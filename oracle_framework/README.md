@@ -78,20 +78,26 @@ Or use it as a library:
 
 ```python
 from oracle_to_s3 import OracleToS3Extract
+from runner import validate_config
 
 job = OracleToS3Extract("config/my_extract.yaml")
 
 # Step-by-step (useful for testing or custom flows):
+cfg     = job.load_config()        # Step 1a: read + parse YAML
+validate_config(cfg)               # Step 1b: schema check (runner-owned)
 job.connect()
 batches = job.execute_query()      # generator
 files   = job.write_csv_files(batches)
 uris    = job.upload_to_s3(files)
 job.cleanup_local(files)
 job.close()
-
-# Or just:
-uris = job.run()
 ```
+
+> Schema validation lives in `runner.py` (`validate_config`), not in the
+> `OracleToS3Extract` class. The framework class is a pure toolkit; the
+> runner owns orchestration and validation. Library callers that
+> bypass the runner should call `validate_config(cfg)` themselves
+> immediately after `load_config()`.
 
 ## YAML reference
 
