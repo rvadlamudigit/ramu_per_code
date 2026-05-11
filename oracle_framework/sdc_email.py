@@ -2,23 +2,25 @@
 sdc_email.py — SMTP relay email utility for the oracle_framework.
 
 Originally authored by Vivek Gautam (2017). Cleaned up and integrated
-with the oracle_framework runner. Fixes in this revision:
+with the oracle_framework runner.
 
-  - `s.quit()` in except block now guarded so it cannot raise NameError
-    when the SMTP() construction itself failed.
-  - Attachments now opened in binary mode and sent as MIME application
-    parts (base64 encoded). No more text-mode corruption of binary or
-    non-UTF-8 files.
-  - Recipient list now strips whitespace per address.
+This relay-style helper assumes the SMTP server does NOT require
+authentication (typical for internal relays). It supports plain text
+or HTML bodies, optional file attachments, retries with exponential
+backoff, and optional STARTTLS for transport encryption.
+
+Fixes vs. the original:
+  - `s.quit()` is now in `finally` and guarded so it cannot raise
+    NameError when SMTP() construction itself failed.
+  - Attachments are opened in binary mode and sent as MIME application
+    parts (text MIME types are still attached as MIMEText). No more
+    text-mode corruption of binary or non-UTF-8 files.
+  - Recipient list is whitespace-stripped per address.
   - Retries use exponential backoff (1s, 2s, 4s).
   - `print()` replaced with logging.
-  - Body method consolidated; `send_email_text` and `send_email_html`
-    are kept as backwards-compatible wrappers around `send_email`.
-  - Added optional `port`, `username`, `password`, `use_tls` parameters
-    for modern SMTP servers.
-  - On full failure, raises EmailSendError so callers can handle it
-    properly. Still returns the status string for backwards compatibility
-    when called via the legacy methods.
+  - One consolidated `send_email` method; `send_email_text` and
+    `send_email_html` are kept as backwards-compatible wrappers.
+  - On full failure raises EmailSendError so callers can react.
 """
 
 from __future__ import annotations
@@ -59,13 +61,12 @@ class SdcAlertUtil(object):
         filename: Optional[str] = None,
         port: int = 25,
         use_tls: bool = False,
-        username: Optional[str] = None,
-        password: Optional[str] = None,
         retries: int = DEFAULT_RETRIES,
         timeout: int = DEFAULT_TIMEOUT,
     ) -> str:
-        """Send an email and return a status string.
+        """Send an email via an SMTP relay (no authentication).
 
+        Returns a status string on success.
         Raises EmailSendError if all retry attempts fail.
         """
         if body_subtype not in ("plain", "html"):
@@ -90,8 +91,6 @@ class SdcAlertUtil(object):
                 s = smtplib.SMTP(host=smtp_server, port=port, timeout=timeout)
                 if use_tls:
                     s.starttls()
-                if username and password:
-                    s.login(username, password)
                 s.sendmail(from_addr, recipients, msg.as_string())
                 logger.info(
                     "Email sent successfully (attempt %d/%d) to %s",

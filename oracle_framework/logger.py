@@ -55,6 +55,7 @@ class LoggerClient(object):
         logoutput: str = "BOTH",
         errorfiledel: str = "~",
         start_time_yyyymmddhh24miss: Optional[str] = None,
+        debug: bool = False,
     ):
         if logoutput not in self.VALID_OUTPUTS:
             raise ValueError(
@@ -69,6 +70,7 @@ class LoggerClient(object):
         self.process_name = process_name
         self.logoutput = logoutput
         self.errorfiledel = errorfiledel
+        self.debug = bool(debug)
 
         if start_time_yyyymmddhh24miss is None:
             self.start_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -102,11 +104,22 @@ class LoggerClient(object):
         log.propagate = False
         log.setLevel(logging.DEBUG)
 
+        # Standard formatter (production-friendly, single-line).
         log_formatter = logging.Formatter(
             f"%(asctime)s.%(msecs)03d :{self.process_name.upper()}: "
             "%(levelname)-8s ~%(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
+        # In debug mode the formatter also carries module / line / thread so
+        # we can map a log line straight back to source code.
+        debug_formatter = logging.Formatter(
+            f"%(asctime)s.%(msecs)03d :{self.process_name.upper()}: "
+            "%(levelname)-8s [%(name)s %(filename)s:%(lineno)d %(threadName)s] "
+            "~%(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        active_formatter = debug_formatter if self.debug else log_formatter
+
         error_formatter = logging.Formatter(
             f"%(asctime)s{self.errorfiledel}{self.process_name.upper()}"
             f"{self.errorfiledel}%(levelname)-8s{self.errorfiledel}%(message)s",
@@ -116,7 +129,7 @@ class LoggerClient(object):
         # Stream handler (stdout)
         if self.logoutput in ("STDOUT", "BOTH"):
             sh = logging.StreamHandler()
-            sh.setFormatter(log_formatter)
+            sh.setFormatter(active_formatter)
             sh.setLevel(logging.DEBUG)
             log.addHandler(sh)
 
@@ -124,12 +137,12 @@ class LoggerClient(object):
             return log
 
         # File handlers (LOGFILE or BOTH)
-        fh_debug = logging.FileHandler(
+        fh_main = logging.FileHandler(
             f"{self.log_file}.log", mode="w", encoding="utf-8"
         )
-        fh_debug.setFormatter(log_formatter)
-        fh_debug.setLevel(logging.DEBUG)
-        log.addHandler(fh_debug)
+        fh_main.setFormatter(active_formatter)
+        fh_main.setLevel(logging.DEBUG)
+        log.addHandler(fh_main)
 
         fh_error = logging.FileHandler(
             f"{self.log_file}.error", mode="w", encoding="utf-8"
@@ -141,9 +154,19 @@ class LoggerClient(object):
         fh_critical = logging.FileHandler(
             f"{self.log_file}.critical", mode="w", encoding="utf-8"
         )
-        fh_critical.setFormatter(log_formatter)
+        fh_critical.setFormatter(active_formatter)
         fh_critical.setLevel(logging.CRITICAL)
         log.addHandler(fh_critical)
+
+        # Debug-only firehose file. Keeps DEBUG noise out of the main .log
+        # for consumers that already pipe .log to ops dashboards.
+        if self.debug:
+            fh_debug = logging.FileHandler(
+                f"{self.log_file}.debug", mode="w", encoding="utf-8"
+            )
+            fh_debug.setFormatter(debug_formatter)
+            fh_debug.setLevel(logging.DEBUG)
+            log.addHandler(fh_debug)
 
         return log
 

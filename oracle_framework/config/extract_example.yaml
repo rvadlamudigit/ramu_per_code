@@ -69,6 +69,14 @@ s3:
 # Local CSVs are deleted from local_dir after a successful S3 upload.
 cleanup_local: true
 
+# ------------------------------- Debug toggle --------------------------------
+# Optional. When `true`, the framework runs in debug mode without needing the
+# `--debug` CLI flag. Debug mode adds: redacted config dump, per-batch row
+# counts, per-file sizes, per-upload throughput, an end-of-run metrics
+# summary, and a separate <process>.debug log file (when a logging: section
+# is also configured). Leave commented out / false for normal production runs.
+# debug: false
+
 # ===================== Optional: logging via LoggerClient ====================
 # When this section is present, the runner switches the root logger over
 # to LoggerClient (logger.py). Output options:
@@ -106,9 +114,6 @@ notifications:
     subject_prefix: "[oracle_framework]"
     port:           25
     use_tls:        false
-    # Optional auth (only if your relay requires it):
-    username:       null
-    password:       null
 
   on_success:
     enabled:        false
@@ -118,5 +123,3 @@ notifications:
     subject_prefix: "[oracle_framework]"
     port:           25
     use_tls:        false
-    username:       null
-    password:       null

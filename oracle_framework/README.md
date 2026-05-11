@@ -52,7 +52,27 @@ AWS-related field needed in the config.
 
 ```
 python runner.py config/extract_example.yaml
+python runner.py -v   config/extract_example.yaml   # stdlib DEBUG only
+python runner.py -d   config/extract_example.yaml   # full debug mode
 ```
+
+### Debug mode (`-d` / `--debug`)
+
+Full framework debug mode enables, on top of plain `--verbose`:
+
+- A redacted dump of the effective YAML config (passwords / KMS key /
+  secret values are masked).
+- Per-batch row counts, fetch timings, and a periodic INFO heartbeat
+  every 10 batches.
+- Per-file row counts and on-disk byte sizes after each CSV is closed.
+- Per-upload throughput (MiB/s) and a phase summary for the S3 step.
+- An end-of-run metrics summary
+  (`rows / batches / files / bytes written / bytes uploaded / phase timings`).
+- A `.debug` log file alongside `.log` / `.error` / `.critical`
+  containing the full DEBUG firehose. The main `.log` keeps its
+  normal verbosity, so existing log-shipping pipelines are unaffected.
+- A richer formatter that includes `filename:lineno` and thread name
+  so every log line is traceable back to source.
 
 Or use it as a library:
 

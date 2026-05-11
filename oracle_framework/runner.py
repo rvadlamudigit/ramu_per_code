@@ -24,14 +24,18 @@ Pipeline:
 
 Usage:
     python runner.py path/to/extract.yaml
-    python runner.py -v path/to/extract.yaml      # debug logging
+    python runner.py -v path/to/extract.yaml      # stdlib DEBUG only
+    python runner.py --debug path/to/extract.yaml # full framework debug mode
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
+import platform
 import sys
+import time
 import traceback
 from typing import List, Optional
 
@@ -64,14 +68,27 @@ EXIT_INTERRUPT = 130
 
 # ----------------------------------------------------------- bootstrap setup
 
-def setup_basic_logging(verbose: bool = False) -> None:
+def setup_basic_logging(verbose: bool = False, debug: bool = False) -> None:
     """Bootstrap stdlib logging so messages from before LoggerClient setup
     (config-load errors, etc.) are still visible.
+
+    --debug always implies DEBUG level. --verbose alone also enables DEBUG.
+    The debug formatter additionally includes module name and line number
+    so traces back to source code are easy.
     """
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    if debug:
+        fmt = (
+            "%(asctime)s [%(levelname)-7s] %(name)s "
+            "(%(filename)s:%(lineno)d): %(message)s"
+        )
+        level = logging.DEBUG
+    elif verbose:
+        fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        level = logging.DEBUG
+    else:
+        fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        level = logging.INFO
+    logging.basicConfig(level=level, format=fmt)
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,19 +101,54 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("config", help="Path to the YAML config file.")
     parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Enable debug logging."
+        "-v", "--verbose", action="store_true",
+        help="Enable stdlib DEBUG-level logging (similar to --debug but "
+             "without the per-batch / metrics traces).",
+    )
+    parser.add_argument(
+        "-d", "--debug", action="store_true",
+        help="Enable full framework debug mode: per-batch row counts, "
+             "per-file sizes, query/write/upload timings, redacted config "
+             "dump, Oracle/boto3 versions, and source file/line in log "
+             "lines. Also forces DEBUG-level on every handler.",
     )
     return parser.parse_args()
+
+
+def _log_runtime_environment(log: logging.Logger) -> None:
+    """Emit a one-shot DEBUG block describing the runtime environment.
+
+    Called once when --debug is on, so that any post-mortem investigation
+    can see exactly which Python / OS / interpreter / cwd produced the run.
+    """
+    log.debug("---- runtime environment ----")
+    log.debug("  python      : %s", sys.version.replace("\n", " "))
+    log.debug("  executable  : %s", sys.executable)
+    log.debug("  platform    : %s", platform.platform())
+    log.debug("  pid         : %s", os.getpid())
+    log.debug("  cwd         : %s", os.getcwd())
+    log.debug("  argv        : %s", sys.argv)
+    # Surface AWS-related env vars (presence only, never values).
+    aws_env = sorted(
+        k for k in os.environ
+        if k.startswith("AWS_") and k not in {"AWS_SECRET_ACCESS_KEY"}
+    )
+    log.debug("  AWS_* env   : %s", aws_env or "<none>")
+    log.debug("-----------------------------")
 
 
 # --------------------------------------------------------- logger integration
 
 def configure_logger_from_yaml(
-    config: dict, verbose: bool = False
+    config: dict, verbose: bool = False, debug: bool = False
 ) -> Optional[LoggerClient]:
     """If YAML has a `logging:` section, build LoggerClient and attach
     its handlers to the root logger. Returns the LoggerClient (or None
     if the section is absent).
+
+    When debug=True the LoggerClient is constructed in debug mode, which
+    forces every handler (stream + files) to DEBUG and uses a richer
+    formatter that includes module/line info.
 
     Expected YAML:
         logging:
@@ -107,6 +159,9 @@ def configure_logger_from_yaml(
     """
     log_cfg = config.get("logging")
     if not log_cfg:
+        logging.getLogger("runner").debug(
+            "No `logging:` section in YAML; staying on stdlib basicConfig."
+        )
         return None
 
     lf = LoggerClient(
@@ -114,16 +169,21 @@ def configure_logger_from_yaml(
         process_name=log_cfg.get("process_name", "extract"),
         root_directory=log_cfg.get("root_directory"),
         logoutput=str(log_cfg.get("output", "BOTH")).upper(),
+        debug=debug,
     )
     lf.attach_to_root()
-    if verbose:
+    if verbose or debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    lf.logfile.info("LoggerClient initialized; output=%s", lf.logoutput)
+    lf.logfile.info(
+        "LoggerClient initialized; output=%s, debug=%s",
+        lf.logoutput, debug,
+    )
     if lf.log_file:
         lf.logfile.info(
-            "Log files: %s.log / %s.error / %s.critical",
+            "Log files: %s.log / %s.error / %s.critical%s",
             lf.log_file, lf.log_file, lf.log_file,
+            f" / {lf.log_file}.debug" if debug else "",
         )
     return lf
 
@@ -154,8 +214,6 @@ def send_notification(
             subject_prefix: "[oracle_framework]"
             port: 25
             use_tls: false
-            username: null
-            password: null
           on_success:
             enabled: false
             ... (same fields)
@@ -207,8 +265,6 @@ def send_notification(
             filename=log_file_path,
             port=int(cfg.get("port", 25)),
             use_tls=bool(cfg.get("use_tls", False)),
-            username=cfg.get("username"),
-            password=cfg.get("password"),
         )
         log.info("Notification email sent (%s).", on)
     except EmailSendError as e:
@@ -222,29 +278,47 @@ def send_notification(
 def run_pipeline(job: OracleToS3Extract) -> List[str]:
     """Drive Steps 2-6 on an already-configured job. Errors propagate."""
     log = logging.getLogger("runner")
+    pipeline_start = time.monotonic()
     try:
         log.info("Step 2/6: connecting to Oracle ...")
+        t = time.monotonic()
         job.connect()
+        log.debug("Step 2 elapsed: %.3fs", time.monotonic() - t)
 
         log.info("Step 3/6: executing SQL ...")
-        batches = job.execute_query()
+        batches = job.execute_query()  # generator -- timing logged in writer
 
         log.info("Step 4/6: writing CSV files to local disk ...")
+        t = time.monotonic()
         files = job.write_csv_files(batches)
+        log.debug("Step 4 elapsed: %.3fs", time.monotonic() - t)
 
         if not files:
             log.warning("No data extracted; nothing to upload.")
             return []
 
         log.info("Step 5/6: uploading %d file(s) to S3 ...", len(files))
+        t = time.monotonic()
         uris = job.upload_to_s3(files)
+        log.debug("Step 5 elapsed: %.3fs", time.monotonic() - t)
 
         log.info("Step 6/6: cleaning up local files ...")
+        t = time.monotonic()
         job.cleanup_local(files)
+        log.debug("Step 6 elapsed: %.3fs", time.monotonic() - t)
 
         return uris
     finally:
+        log.info(
+            "Pipeline phase finished in %.3fs (will close DB).",
+            time.monotonic() - pipeline_start,
+        )
         job.close()
+        # Always emit the metrics summary, success or failure.
+        try:
+            job.log_summary()
+        except Exception as e:  # noqa: BLE001
+            log.debug("log_summary raised (ignored): %s", e)
 
 
 # --------------------------------------------------------------------- main --
@@ -263,9 +337,15 @@ def _handle_error(
     config: Optional[dict],
     lf: Optional[LoggerClient],
     verbose: bool = False,
+    debug: bool = False,
 ) -> int:
+    log = logging.getLogger("runner")
     print(f"[ERROR] {label}: {error}", file=sys.stderr)
-    if verbose and not isinstance(error, OracleToS3ExtractError):
+    # In --debug or --verbose, ALWAYS dump the chained traceback so the
+    # user sees the original exception too (chained via `raise ... from e`).
+    if debug or verbose:
+        log.exception("%s -> %s: %s", label, type(error).__name__, error)
+    if (verbose or debug) and not isinstance(error, OracleToS3ExtractError):
         traceback.print_exc(file=sys.stderr)
     send_notification(
         config, "on_failure",
@@ -277,22 +357,29 @@ def _handle_error(
 
 def main() -> int:
     args = parse_args()
-    setup_basic_logging(args.verbose)
+    setup_basic_logging(args.verbose, debug=args.debug)
     log = logging.getLogger("runner")
 
+    if args.debug:
+        log.debug("DEBUG mode enabled via --debug")
+        _log_runtime_environment(log)
+
+    overall_start = time.monotonic()
     config: Optional[dict] = None
     lf: Optional[LoggerClient] = None
 
     # ============================ MAIN EXCEPTION BLOCK ===========================
     try:
         # Step 1: build job and load config
-        job = OracleToS3Extract(args.config)
+        job = OracleToS3Extract(args.config, debug=args.debug)
         log.info("Step 1/6: loading YAML config from %s ...", args.config)
         config = job.load_config()
         log.info("Loaded config sections: %s", sorted(config.keys()))
 
         # Switch to LoggerClient if YAML configures it
-        lf = configure_logger_from_yaml(config, verbose=args.verbose)
+        lf = configure_logger_from_yaml(
+            config, verbose=args.verbose, debug=args.debug or job.debug,
+        )
 
         # Steps 2-6
         uris = run_pipeline(job)
@@ -304,6 +391,11 @@ def main() -> int:
             for uri in uris:
                 print(f"  - {uri}")
 
+        log.info(
+            "Total runner wall time: %.3fs",
+            time.monotonic() - overall_start,
+        )
+
         # Success notification (best-effort)
         send_notification(
             config, "on_success",
@@ -314,35 +406,39 @@ def main() -> int:
 
     except ConfigError as e:
         return _handle_error(
-            e, EXIT_CONFIG, "Configuration error", config, lf, args.verbose
+            e, EXIT_CONFIG, "Configuration error",
+            config, lf, args.verbose, args.debug,
         )
     except SecretsManagerError as e:
         return _handle_error(
             e, EXIT_SECRETS, "AWS Secrets Manager error",
-            config, lf, args.verbose,
+            config, lf, args.verbose, args.debug,
         )
     except OracleConnectionError as e:
         return _handle_error(
             e, EXIT_ORACLE_CONNECT, "Oracle connection error",
-            config, lf, args.verbose,
+            config, lf, args.verbose, args.debug,
         )
     except OracleQueryError as e:
         return _handle_error(
             e, EXIT_ORACLE_QUERY, "Oracle query error",
-            config, lf, args.verbose,
+            config, lf, args.verbose, args.debug,
         )
     except CSVWriteError as e:
         return _handle_error(
-            e, EXIT_CSV, "CSV write error", config, lf, args.verbose
+            e, EXIT_CSV, "CSV write error",
+            config, lf, args.verbose, args.debug,
         )
     except S3UploadError as e:
         return _handle_error(
-            e, EXIT_S3, "S3 upload error", config, lf, args.verbose
+            e, EXIT_S3, "S3 upload error",
+            config, lf, args.verbose, args.debug,
         )
     except OracleToS3ExtractError as e:
         # Fallback for any new framework exception subclass.
         return _handle_error(
-            e, EXIT_GENERIC, "Extract failed", config, lf, args.verbose
+            e, EXIT_GENERIC, "Extract failed",
+            config, lf, args.verbose, args.debug,
         )
 
     except KeyboardInterrupt:
@@ -356,7 +452,7 @@ def main() -> int:
             f"[ERROR] Unexpected error: {type(e).__name__}: {e}",
             file=sys.stderr,
         )
-        if args.verbose:
+        if args.verbose or args.debug:
             traceback.print_exc(file=sys.stderr)
         else:
             log.exception("Unexpected error during extract")
