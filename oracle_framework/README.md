@@ -37,9 +37,30 @@ pip install -r requirements.txt
 ```
 
 `oracledb` runs in pure-Python "thin" mode by default, so no Oracle
-Instant Client is required. If you need thick mode (legacy features,
-advanced security), install Instant Client and call
-`oracledb.init_oracle_client(lib_dir=...)` before constructing the job.
+Instant Client is required.
+
+If you hit a thick-mode-only error like:
+
+```
+DPY-3001: ... only supported in python-oracledb thick mode
+init_oracle_client() must be called first
+```
+
+turn thick mode on in YAML and (optionally) point the runner at your
+Instant Client install:
+
+```yaml
+oracle:
+  thick_mode:        true
+  client_lib_dir:    /opt/oracle/instantclient_21_12     # optional
+  client_config_dir: /etc/oracle                          # optional
+```
+
+When `thick_mode: true`, the runner calls `oracledb.init_oracle_client(...)`
+once, **before** any database connection, and logs the resolved client
+version through the same LoggerClient as the rest of the run. If
+`client_lib_dir` is omitted, oracledb falls back to the OS library
+search path (`LD_LIBRARY_PATH` / `PATH` / `DYLD_LIBRARY_PATH`).
 
 ## AWS credentials
 

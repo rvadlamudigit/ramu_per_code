@@ -27,6 +27,22 @@ oracle:
   #   "tcps://host:2484/SERVICE_NAME?wallet_location=/path/to/wallet"
   dsn: oracle-host.example.com:1521/ORCL
 
+  # ---------- Optional: Oracle Client thick mode ----------
+  # python-oracledb defaults to "thin" mode (pure Python, no Oracle
+  # Instant Client required). Set thick_mode: true only if you hit a
+  # feature that requires the C client library -- for example:
+  #   * "DPY-3001: ... only supported in python-oracledb thick mode"
+  #   * "init_oracle_client() must be called first"
+  #   * Oracle DB older than 12.1
+  #   * wallet auto-login, Advanced Queueing, application continuity, etc.
+  # When enabled, the runner calls oracledb.init_oracle_client(...) once
+  # before any connection. client_lib_dir is optional; if omitted,
+  # oracledb falls back to LD_LIBRARY_PATH / PATH / DYLD_LIBRARY_PATH.
+  #
+  # thick_mode:        true
+  # client_lib_dir:    /opt/oracle/instantclient_21_12
+  # client_config_dir: /etc/oracle    # holds tnsnames.ora / sqlnet.ora / wallets
+
 # ----------------------------------- SQL -------------------------------------
 sql: |
   SELECT id, name, created_at, status

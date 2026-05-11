@@ -23,15 +23,17 @@ Drives the toolkit and OWNS:
     does not change the program's exit code.
 
 Pipeline:
-    Step 1a read_yaml           -- read & parse YAML, return dict
-    Step 1b validate_config     -- schema check (raises ConfigError)
-    Step 1c make_logger         -- build `lc` (LoggerClient)
-    Step 1d build job           -- OracleToS3Extract(lc, cfg, debug=...)
-    Step 2  connect             -- open Oracle connection
-    Step 3  execute_query       -- generator over result batches
-    Step 4  write_csv_files     -- chunked CSV files on local disk
-    Step 5  upload_to_s3        -- upload (optionally KMS-encrypted)
-    Step 6  cleanup_local       -- delete local copies
+    Step 1a read_yaml                   -- read & parse YAML, return dict
+    Step 1b validate_config             -- schema check (raises ConfigError)
+    Step 1c make_logger                 -- build `lc` (LoggerClient)
+    Step 1c.5 init_oracle_client_if_requested
+                                        -- thick-mode init (no-op for thin)
+    Step 1d build job                   -- OracleToS3Extract(lc, cfg, debug)
+    Step 2  connect                     -- open Oracle connection
+    Step 3  execute_query               -- generator over result batches
+    Step 4  write_csv_files             -- chunked CSV files on local disk
+    Step 5  upload_to_s3                -- upload (optionally KMS-encrypted)
+    Step 6  cleanup_local               -- delete local copies
 
 Usage:
     python runner.py path/to/extract.yaml
@@ -50,6 +52,7 @@ import time
 import traceback
 from typing import List, Optional
 
+import oracledb
 import yaml
 
 from oracle_to_s3 import (
@@ -192,6 +195,21 @@ def validate_config(cfg: dict) -> None:
     if "dsn" not in oracle_cfg:
         raise ConfigError("oracle.dsn is required")
 
+    # Thick-mode keys are optional; only type-check what's present.
+    if "thick_mode" in oracle_cfg and not isinstance(
+        oracle_cfg["thick_mode"], bool
+    ):
+        raise ConfigError(
+            f"oracle.thick_mode must be a boolean, got "
+            f"{oracle_cfg['thick_mode']!r}"
+        )
+    for k in ("client_lib_dir", "client_config_dir"):
+        if k in oracle_cfg and not isinstance(oracle_cfg[k], str):
+            raise ConfigError(
+                f"oracle.{k} must be a string path, got "
+                f"{type(oracle_cfg[k]).__name__}"
+            )
+
     method = str(oracle_cfg.get("auth_method", "plain")).lower()
     log.debug("validate_config: oracle.auth_method=%s", method)
     if method == "plain":
@@ -325,6 +343,94 @@ def make_logger(
             f" / {lc.log_file}.debug" if debug else "",
         )
     return lc
+
+
+# ----------------------------------------------------- oracle client (thick) -
+
+def init_oracle_client_if_requested(cfg: dict, lc: LoggerClient) -> None:
+    """Step 1c.5: optionally enable Oracle thick mode.
+
+    Called by the runner between `make_logger` and constructing the
+    framework class. Must run BEFORE any ``oracledb.connect()`` because
+    oracledb cannot switch modes after the first connection is opened.
+
+    YAML knobs (all under the ``oracle:`` section, all optional):
+
+      oracle:
+        thick_mode:        true                # default: false (thin)
+        client_lib_dir:    /opt/oracle/instantclient_21_12   # optional
+        client_config_dir: /etc/oracle          # optional, tnsnames/wallets
+
+    Behaviour:
+      * ``thick_mode`` false / missing      -> stay in thin mode, no-op.
+      * ``thick_mode`` true, already thick  -> no-op (idempotent).
+      * ``thick_mode`` true, currently thin -> call
+        ``oracledb.init_oracle_client(lib_dir=..., config_dir=...)``
+        once. ``lib_dir`` may be omitted, in which case oracledb falls
+        back to the OS library search path (LD_LIBRARY_PATH / PATH /
+        DYLD_LIBRARY_PATH / Oracle Instant Client installer registry).
+
+    Errors are surfaced as OracleConnectionError so the runner's main
+    exception block routes them through the same handler that catches
+    the later ``connect()`` failures (clear log, on_failure email,
+    EXIT_ORACLE_CONNECT exit code).
+    """
+    log = lc.logfile
+    oracle_cfg = cfg.get("oracle") or {}
+    if not bool(oracle_cfg.get("thick_mode", False)):
+        log.debug("oracle.thick_mode not requested; staying in thin mode.")
+        return
+
+    # is_thin_mode() returns False once thick mode is active. Guard
+    # against duplicate init -- oracledb raises DPI-1014 otherwise.
+    try:
+        already_thick = not oracledb.is_thin_mode()
+    except Exception:  # noqa: BLE001
+        already_thick = False
+    if already_thick:
+        log.info(
+            "oracledb already in thick mode (client_version=%s); "
+            "skipping init_oracle_client().",
+            getattr(oracledb, "clientversion", lambda: "?")(),
+        )
+        return
+
+    lib_dir = oracle_cfg.get("client_lib_dir")
+    config_dir = oracle_cfg.get("client_config_dir")
+
+    log.info(
+        "Initializing Oracle Client for thick mode (lib_dir=%s, config_dir=%s)",
+        lib_dir or "<system path>",
+        config_dir or "<system path>",
+    )
+
+    kwargs: dict = {}
+    if lib_dir:
+        kwargs["lib_dir"] = lib_dir
+    if config_dir:
+        kwargs["config_dir"] = config_dir
+
+    try:
+        oracledb.init_oracle_client(**kwargs)
+    except oracledb.Error as e:
+        log.error("oracledb.init_oracle_client() failed: %s", e)
+        raise OracleConnectionError(
+            f"Failed to initialize Oracle Client (thick mode). "
+            f"Check that Instant Client is installed and lib_dir is "
+            f"correct: {e}"
+        ) from e
+
+    # Log the resolved client version so post-mortems can see which
+    # Instant Client was actually picked up.
+    try:
+        client_version = oracledb.clientversion()
+    except Exception:  # noqa: BLE001
+        client_version = "<unknown>"
+    log.info(
+        "Oracle Client initialized successfully "
+        "(thin_mode=%s, client_version=%s)",
+        oracledb.is_thin_mode(), client_version,
+    )
 
 
 # -------------------------------------------------------- email notifications
@@ -530,6 +636,10 @@ def main() -> int:
         debug_on = bool(args.debug) or bool(config.get("debug", False))
         lc = make_logger(config, verbose=args.verbose, debug=debug_on)
         log = lc.logfile  # everything from here on logs through lc
+
+        # Step 1c.5: if YAML requests thick mode, init Oracle Client now
+        # -- BEFORE any oracledb.connect(). Safe no-op otherwise.
+        init_oracle_client_if_requested(config, lc)
 
         # Step 1d: build the framework class with the logger and the
         # already-validated config dict.
