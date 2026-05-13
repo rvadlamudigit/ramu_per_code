@@ -1,0 +1,128 @@
+[
+  {
+    "master_role": "FARMERS_MASTER1",
+    "database": "DB1",
+    "schema": "SCH1",
+    "permissions": [
+      "SELECT",
+      "USAGE"
+    ],
+    "paths": [
+      {
+        "descendant_role": "CHILD5",
+        "depth": 2,
+        "role_path": [
+          "FARMERS_MASTER1",
+          "CHILD10",
+          "CHILD5"
+        ],
+        "privileges": [
+          "USAGE"
+        ]
+      },
+      {
+        "descendant_role": "CHILD3",
+        "depth": 3,
+        "role_path": [
+          "FARMERS_MASTER1",
+          "CHILD1",
+          "CHILD2",
+          "CHILD3"
+        ],
+        "privileges": [
+          "SELECT",
+          "USAGE"
+        ]
+      }
+    ]
+  },
+  {
+    "master_role": "FARMERS_MASTER1",
+    "database": "DB2",
+    "schema": "SCH2",
+    "permissions": [
+      "USAGE"
+    ],
+    "paths": [
+      {
+        "descendant_role": "CHILD4",
+        "depth": 3,
+        "role_path": [
+          "FARMERS_MASTER1",
+          "CHILD1",
+          "CHILD2",
+          "CHILD4"
+        ],
+        "privileges": [
+          "USAGE"
+        ]
+      }
+    ]
+  },
+  {
+    "master_role": "FARMERS_MASTER1",
+    "database": "DB3",
+    "schema": "SCH3",
+    "permissions": [
+      "SELECT"
+    ],
+    "paths": [
+      {
+        "descendant_role": "CHILD5",
+        "depth": 2,
+        "role_path": [
+          "FARMERS_MASTER1",
+          "CHILD10",
+          "CHILD5"
+        ],
+        "privileges": [
+          "SELECT"
+        ]
+      }
+    ]
+  },
+  {
+    "master_role": "FARMERS_MASTER2",
+    "database": "DB1",
+    "schema": "SCH1",
+    "permissions": [
+      "USAGE"
+    ],
+    "paths": [
+      {
+        "descendant_role": "CHILD5",
+        "depth": 2,
+        "role_path": [
+          "FARMERS_MASTER2",
+          "CHILD10",
+          "CHILD5"
+        ],
+        "privileges": [
+          "USAGE"
+        ]
+      }
+    ]
+  },
+  {
+    "master_role": "FARMERS_MASTER2",
+    "database": "DB3",
+    "schema": "SCH3",
+    "permissions": [
+      "SELECT"
+    ],
+    "paths": [
+      {
+        "descendant_role": "CHILD5",
+        "depth": 2,
+        "role_path": [
+          "FARMERS_MASTER2",
+          "CHILD10",
+          "CHILD5"
+        ],
+        "privileges": [
+          "SELECT"
+        ]
+      }
+    ]
+  }
+]
